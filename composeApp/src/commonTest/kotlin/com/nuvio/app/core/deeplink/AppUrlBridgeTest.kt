@@ -74,4 +74,21 @@ class AppUrlBridgeTest {
     fun `does not treat non-host stremio link as addon install`() {
         assertNull(parseAppDeepLink("stremio://detail/series/tt0944947"))
     }
+
+    @Test
+    fun `parses payment approved deeplinks with email`() {
+        assertEquals(
+            AppDeepLink.PaymentApproved("cliente.teste@gmail.com"),
+            parseAppDeepLink("nuvio://paid?email=cliente.teste@gmail.com"),
+        )
+        assertEquals(
+            AppDeepLink.PaymentApproved("usuario@gmail.com"),
+            parseAppDeepLink("cineultimate://paid?email=usuario%40gmail.com"),
+        )
+        assertEquals(
+            AppDeepLink.PaymentApproved("outro@gmail.com"),
+            parseAppDeepLink("nuvio://auth?paid=true&email=outro@gmail.com"),
+        )
+        assertNull(parseAppDeepLink("nuvio://paid"))
+    }
 }

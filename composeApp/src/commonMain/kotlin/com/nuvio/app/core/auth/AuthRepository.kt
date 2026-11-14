@@ -9,8 +9,6 @@ import io.github.jan.supabase.auth.providers.builtin.Email
 import io.github.jan.supabase.auth.status.SessionStatus
 import io.github.jan.supabase.exceptions.RestException
 import io.github.jan.supabase.functions.functions
-import kotlin.uuid.ExperimentalUuidApi
-import kotlin.uuid.Uuid
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,11 +51,12 @@ object AuthRepository {
                     is SessionStatus.Authenticated -> {
                         val user = status.session.user
                         val userId = user?.id.orEmpty()
-                        if (!validateRemoteSession(userId)) return@collect
+                        val email = user?.email?.trim()?.lowercase().orEmpty()
+                        if (!validateRemoteSession(userId, email)) return@collect
                         explicitSignOutRequested = false
                         _state.value = AuthState.Authenticated(
                             userId = userId,
-                            email = user?.email,
+                            email = email,
                             isAnonymous = false,
                         )
                     }
@@ -75,12 +74,15 @@ object AuthRepository {
         }
     }
 
-    private suspend fun validateRemoteSession(userId: String): Boolean {
-        if (userId.isBlank() || validatedRemoteUserId == userId) return true
+    private suspend fun validateRemoteSession(userId: String, email: String): Boolean {
+        if (userId.isBlank() || email.isBlank()) {
+            clearLocalSessionAfterRemoteInvalidation()
+            return false
+        }
+        if (validatedRemoteUserId == userId) return true
 
-        return runCatching {
+        val sessionValid = runCatching {
             SupabaseProvider.client.auth.retrieveUserForCurrentSession(false)
-            validatedRemoteUserId = userId
             true
         }.getOrElse { e ->
             if (isInvalidRemoteSessionError(e)) {
@@ -92,100 +94,102 @@ object AuthRepository {
                 true
             }
         }
+        if (!sessionValid) return false
+
+        val entitlementCheck = CineAuthClient.checkEmail(email)
+        if (entitlementCheck.isSuccess) {
+            val info = entitlementCheck.getOrThrow()
+            if (!info.entitlementActive) {
+                log.w { "Account $email does not have an active PIX entitlement; clearing session" }
+                clearLocalSessionAfterRemoteInvalidation()
+                _error.value = "Acesso negado: Este Gmail ($email) não possui pagamento aprovado de R$ 10,00."
+                return false
+            }
+            validatedRemoteUserId = userId
+        }
+        return true
     }
 
-    @OptIn(ExperimentalUuidApi::class)
     fun signInAnonymously() {
-        _error.value = null
-        explicitSignOutRequested = false
-        val userId = AuthStorage.loadAnonymousUserId() ?: Uuid.random().toString()
-        AuthStorage.saveAnonymousUserId(userId)
-        _state.value = AuthState.Authenticated(
-            userId = userId,
-            email = null,
-            isAnonymous = true,
-        )
+        _error.value = "Acesso anônimo não permitido. Realize o pagamento de R$ 10,00 no site oficial para liberar seu acesso."
+        AuthStorage.clearAnonymousUserId()
+        _state.value = AuthState.Unauthenticated
     }
 
-    @OptIn(ExperimentalUuidApi::class)
-    suspend fun signUpWithEmail(email: String, password: String): Result<Unit> = runCatching {
-        _error.value = null
-        explicitSignOutRequested = false
-        val userInfo = runCatching {
-            SupabaseProvider.client.auth.signUpWith(Email) {
-                this.email = email
-                this.password = password
-            }
-        }.getOrNull()
-
-        val currentSession = SupabaseProvider.client.auth.currentSessionOrNull()
-        if (currentSession != null) {
-            AuthStorage.clearAnonymousUserId()
-            val userId = currentSession.user?.id ?: userInfo?.id ?: Uuid.random().toString()
-            _state.value = AuthState.Authenticated(
-                userId = userId,
-                email = currentSession.user?.email ?: email,
-                isAnonymous = false,
-            )
-            return@runCatching
-        }
-
-        val signInAttempt = runCatching {
-            SupabaseProvider.client.auth.signInWith(Email) {
-                this.email = email
-                this.password = password
-            }
-        }
-        val sessionAfterSignIn = SupabaseProvider.client.auth.currentSessionOrNull()
-        if (signInAttempt.isSuccess && sessionAfterSignIn != null) {
-            AuthStorage.clearAnonymousUserId()
-            val userId = sessionAfterSignIn.user?.id ?: userInfo?.id ?: Uuid.random().toString()
-            _state.value = AuthState.Authenticated(
-                userId = userId,
-                email = sessionAfterSignIn.user?.email ?: email,
-                isAnonymous = false,
-            )
-        } else {
-            val userId = userInfo?.id?.takeIf { it.isNotBlank() }
-                ?: AuthStorage.loadAnonymousUserId()
-                ?: Uuid.random().toString()
-            AuthStorage.saveAnonymousUserId(userId)
-            _state.value = AuthState.Authenticated(
-                userId = userId,
-                email = email,
-                isAnonymous = true,
-            )
-        }
-        Unit
-    }.onFailure { e ->
-        log.e(e) { "Email sign-up failed, falling back to immediate local access" }
-        val userId = AuthStorage.loadAnonymousUserId() ?: Uuid.random().toString()
-        AuthStorage.saveAnonymousUserId(userId)
-        _state.value = AuthState.Authenticated(
-            userId = userId,
-            email = email,
-            isAnonymous = true,
-        )
-    }
-
-    @OptIn(ExperimentalUuidApi::class)
-    suspend fun signInWithEmail(email: String, password: String): Result<Unit> = runCatching {
+    suspend fun signUpWithEmail(email: String, password: String): Result<Unit> {
         _error.value = null
         explicitSignOutRequested = false
         AuthStorage.clearAnonymousUserId()
-        SupabaseProvider.client.auth.signInWith(Email) {
-            this.email = email
-            this.password = password
+        val normalizedEmail = email.trim().lowercase()
+
+        val backendResult = CineAuthClient.register(normalizedEmail, password)
+        if (backendResult.isFailure) {
+            val ex = backendResult.exceptionOrNull()
+            val msg = ex?.message ?: "Acesso negado: O Gmail $normalizedEmail não possui pagamento PIX de R$ 10,00 aprovado."
+            _error.value = msg
+            return Result.failure(ex ?: Exception(msg))
         }
-    }.recoverCatching { e ->
-        log.w(e) { "Remote sign-in did not complete, granting immediate access without confirmation" }
-        val userId = AuthStorage.loadAnonymousUserId() ?: Uuid.random().toString()
-        AuthStorage.saveAnonymousUserId(userId)
-        _state.value = AuthState.Authenticated(
-            userId = userId,
-            email = email,
-            isAnonymous = true,
-        )
+
+        return runCatching {
+            val backendUserId = backendResult.getOrThrow().user.id
+            validatedRemoteUserId = backendUserId
+            SupabaseProvider.client.auth.signInWith(Email) {
+                this.email = normalizedEmail
+                this.password = password
+            }
+            val currentSession = SupabaseProvider.client.auth.currentSessionOrNull()
+                ?: throw Exception("Sessão não iniciada após criação da conta.")
+            val userId = currentSession.user?.id ?: backendUserId
+            validatedRemoteUserId = userId
+            _state.value = AuthState.Authenticated(
+                userId = userId,
+                email = currentSession.user?.email ?: normalizedEmail,
+                isAnonymous = false,
+            )
+            Unit
+        }.onFailure { e ->
+            log.e(e) { "Email sign-up session initialization failed" }
+            validatedRemoteUserId = null
+            _error.value = e.message ?: "Não foi possível iniciar sessão. Tente fazer login."
+        }
+    }
+
+    suspend fun signInWithEmail(email: String, password: String): Result<Unit> {
+        _error.value = null
+        explicitSignOutRequested = false
+        AuthStorage.clearAnonymousUserId()
+        val normalizedEmail = email.trim().lowercase()
+
+        val backendResult = CineAuthClient.login(normalizedEmail, password)
+        if (backendResult.isFailure) {
+            val ex = backendResult.exceptionOrNull()
+            val msg = ex?.message ?: "Gmail ou senha incorretos ou pagamento não encontrado."
+            _error.value = msg
+            return Result.failure(ex ?: Exception(msg))
+        }
+
+        return runCatching {
+            val backendUserId = backendResult.getOrThrow().user.id
+            validatedRemoteUserId = backendUserId
+            SupabaseProvider.client.auth.signInWith(Email) {
+                this.email = normalizedEmail
+                this.password = password
+            }
+            val currentSession = SupabaseProvider.client.auth.currentSessionOrNull()
+                ?: throw Exception("Sessão não iniciada.")
+            val userId = currentSession.user?.id ?: backendUserId
+            validatedRemoteUserId = userId
+            _state.value = AuthState.Authenticated(
+                userId = userId,
+                email = currentSession.user?.email ?: normalizedEmail,
+                isAnonymous = false,
+            )
+            Unit
+        }.onFailure { e ->
+            log.e(e) { "Email sign-in failed" }
+            validatedRemoteUserId = null
+            _error.value = e.message ?: "Gmail ou senha incorretos."
+        }
     }
 
     suspend fun signOut(): Result<Unit> {

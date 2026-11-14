@@ -26,6 +26,11 @@ internal sealed interface AppDeepLink {
     data class Party(
         val code: String,
     ) : AppDeepLink
+
+    data class PaymentApproved(
+        val email: String,
+        val paymentId: String? = null,
+    ) : AppDeepLink
 }
 
 internal object AppDeepLinkRepository {
@@ -82,9 +87,15 @@ internal fun parseAppDeepLink(url: String): AppDeepLink? {
     if (scheme == "https") {
         return if (host == "nuvio.tv" && pathSegments.firstOrNull() == "party") partyDeepLink(pathSegments.getOrNull(1)) else null
     }
-    if (scheme != "nuvio") return null
+    if (scheme != "nuvio" && scheme != "cineultimate") return null
 
     return when (host) {
+        "paid", "payment" -> {
+            val email = firstParameter(parsedUrl, "email")?.trim()?.lowercase().orEmpty()
+            val paymentId = firstParameter(parsedUrl, "paymentId", "payment_id")
+            if (email.isNotBlank()) AppDeepLink.PaymentApproved(email = email, paymentId = paymentId) else null
+        }
+
         "meta" -> {
             parseMetaFromParameters(parsedUrl)
                 ?: parseMetaFromPath(pathSegments)
@@ -104,7 +115,15 @@ internal fun parseAppDeepLink(url: String): AppDeepLink? {
 
         "party" -> partyDeepLink(pathSegments.firstOrNull() ?: firstParameter(parsedUrl, "code"))
 
-        "auth" -> null
+        "auth" -> {
+            val email = firstParameter(parsedUrl, "email")?.trim()?.lowercase().orEmpty()
+            val paymentId = firstParameter(parsedUrl, "paymentId", "payment_id")
+            if (email.isNotBlank() && (pathSegments.contains("paid") || firstParameter(parsedUrl, "paid") == "true")) {
+                AppDeepLink.PaymentApproved(email = email, paymentId = paymentId)
+            } else {
+                null
+            }
+        }
 
         else -> {
             if (looksLikeAddonHost(host)) {

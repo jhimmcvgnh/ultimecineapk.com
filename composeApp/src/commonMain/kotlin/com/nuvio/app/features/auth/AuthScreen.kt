@@ -86,14 +86,23 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.auth.AuthRepository
+import com.nuvio.app.core.auth.CineAuthClient
 import com.nuvio.app.core.auth.DeviceLinkAuthRepository
 import com.nuvio.app.core.auth.DeviceLinkAuthState
 import com.nuvio.app.core.build.AppFeaturePolicy
+import com.nuvio.app.core.deeplink.AppDeepLink
+import com.nuvio.app.core.deeplink.AppDeepLinkRepository
+import com.nuvio.app.core.network.CineBackendConfig
+import com.nuvio.app.core.sync.AppForegroundMonitor
+import com.nuvio.app.core.sync.AppVisibility
 import com.nuvio.app.features.settings.AppBrandWordmark
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.PI
 import kotlin.math.sin
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.compose_auth_already_have_account
@@ -186,6 +195,7 @@ private fun largeAuthFormMetrics(scale: Float): AuthFormMetrics = LargeAuthFormM
     secondaryHeight = 56.dp * scale,
 )
 
+@OptIn(ExperimentalUuidApi::class)
 @Composable
 fun AuthScreen(
     modifier: Modifier = Modifier,
@@ -193,8 +203,17 @@ fun AuthScreen(
     val authError by AuthRepository.error.collectAsStateWithLifecycle()
     val deviceLinkAuthState by DeviceLinkAuthRepository.state.collectAsStateWithLifecycle()
     val serverConnectionState by ServerConnectionController.state.collectAsStateWithLifecycle()
+    val pendingDeepLink by AppDeepLinkRepository.pendingDeepLink.collectAsStateWithLifecycle()
+    val appVisibility by AppForegroundMonitor.events().collectAsStateWithLifecycle(initialValue = AppVisibility.Foreground)
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
+    val uriHandler = LocalUriHandler.current
+
+    var showLoginScreen by rememberSaveable { mutableStateOf(false) }
+    var verifiedPaidEmail by rememberSaveable { mutableStateOf<String?>(null) }
+    var activeCheckoutSessionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var localError by rememberSaveable { mutableStateOf<String?>(null) }
+
     var isSignUp by rememberSaveable { mutableStateOf(true) }
     var email by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
@@ -205,8 +224,92 @@ fun AuthScreen(
     var showServerSheet by rememberSaveable { mutableStateOf(false) }
     var showOfficialServerDialog by rememberSaveable { mutableStateOf(false) }
 
+    val effectiveError = localError ?: authError
+
+    LaunchedEffect(pendingDeepLink) {
+        val deepLink = pendingDeepLink
+        if (deepLink is AppDeepLink.PaymentApproved) {
+            val paidEmail = deepLink.email.trim().lowercase()
+            AppDeepLinkRepository.markConsumed(deepLink)
+            if (paidEmail.isNotBlank()) {
+                if (verifiedPaidEmail == paidEmail && showLoginScreen) {
+                    activeCheckoutSessionId = null
+                    return@LaunchedEffect
+                }
+                isLoading = true
+                localError = null
+                AuthRepository.clearError()
+                val check = CineAuthClient.checkEmail(paidEmail, deepLink.paymentId)
+                isLoading = false
+                if (check.isSuccess) {
+                    val info = check.getOrThrow()
+                    if (info.entitlementActive) {
+                        email = info.email
+                        verifiedPaidEmail = info.email
+                        isSignUp = !info.hasAccount
+                        activeCheckoutSessionId = null
+                        showLoginScreen = true
+                    } else {
+                        localError = "Acesso negado: O Gmail $paidEmail ainda não possui pagamento PIX de R$ 10,00 aprovado."
+                        showLoginScreen = false
+                    }
+                } else {
+                    localError = check.exceptionOrNull()?.message
+                        ?: "Não foi possível confirmar o pagamento do Gmail $paidEmail."
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(activeCheckoutSessionId, showLoginScreen, appVisibility) {
+        val sessionId = activeCheckoutSessionId ?: return@LaunchedEffect
+        if (showLoginScreen) return@LaunchedEffect
+
+        repeat(600) { attempt ->
+            if (attempt > 0) {
+                delay(if (appVisibility == AppVisibility.Foreground) 1_000L else 4_000L)
+            }
+            val statusResult = CineAuthClient.checkSessionStatus(sessionId)
+            val status = statusResult.getOrNull()
+            if (status != null && status.approved && status.email.isNotBlank()) {
+                email = status.email
+                verifiedPaidEmail = status.email
+                isSignUp = !status.hasAccount
+                activeCheckoutSessionId = null
+                localError = null
+                AuthRepository.clearError()
+                showLoginScreen = true
+                return@LaunchedEffect
+            }
+        }
+    }
+
+    fun startCheckout() {
+        localError = null
+        AuthRepository.clearError()
+        val sessionId = "chk_${Uuid.random()}"
+        activeCheckoutSessionId = sessionId
+        uriHandler.openUri("${CineBackendConfig.checkoutUrl}?session=$sessionId")
+    }
+
+    fun openExistingAccountLogin() {
+        localError = null
+        AuthRepository.clearError()
+        verifiedPaidEmail = null
+        isSignUp = false
+        showLoginScreen = true
+    }
+
+    fun returnToPaywall() {
+        localError = null
+        AuthRepository.clearError()
+        verifiedPaidEmail = null
+        showLoginScreen = false
+    }
+
     fun submitAuth() {
         if (email.isBlank() || password.length < 6 || isLoading) return
+        localError = null
         DeviceLinkAuthRepository.cancel()
         isLoading = true
         focusManager.clearFocus(force = true)
@@ -220,12 +323,14 @@ fun AuthScreen(
     fun toggleAuthMode() {
         DeviceLinkAuthRepository.cancel()
         isSignUp = !isSignUp
+        localError = null
         AuthRepository.clearError()
     }
 
     fun startDeviceLink() {
         if (isLoading) return
         focusManager.clearFocus(force = true)
+        localError = null
         AuthRepository.clearError()
         DeviceLinkAuthRepository.start()
     }
@@ -282,12 +387,15 @@ fun AuthScreen(
 
                     AuthLargeLayout(
                         modifier = Modifier.fillMaxSize(),
+                        showLoginScreen = showLoginScreen,
+                        verifiedPaidEmail = verifiedPaidEmail,
+                        isWaitingPayment = activeCheckoutSessionId != null && !showLoginScreen,
                         isSignUp = isSignUp,
                         email = email,
                         password = password,
                         passwordVisible = passwordVisible,
                         isLoading = isLoading,
-                        authError = authError,
+                        authError = effectiveError,
                         deviceLinkAuthState = deviceLinkAuthState,
                         deviceLinkEnabled = serverConnectionState.activeServer.capabilities.tvLogin,
                         formPaneWidth = if (compactLargeScreen) 460.dp else formPaneWidth,
@@ -296,21 +404,23 @@ fun AuthScreen(
                         formMetrics = formMetrics,
                         scale = largeScale,
                         onEmailChange = {
-                            email = it
+                            if (verifiedPaidEmail == null) {
+                                email = it
+                            }
+                            localError = null
                             AuthRepository.clearError()
                         },
                         onPasswordChange = {
                             password = it
+                            localError = null
                             AuthRepository.clearError()
                         },
                         onPasswordVisibilityToggle = { passwordVisible = !passwordVisible },
                         onSubmit = ::submitAuth,
                         onToggleAuthMode = ::toggleAuthMode,
-                        onContinueWithoutAccount = {
-                            focusManager.clearFocus(force = true)
-                            DeviceLinkAuthRepository.cancel()
-                            AuthRepository.signInAnonymously()
-                        },
+                        onStartCheckout = ::startCheckout,
+                        onOpenExistingAccountLogin = ::openExistingAccountLogin,
+                        onReturnToPaywall = ::returnToPaywall,
                         onStartDeviceLink = ::startDeviceLink,
                         onCancelDeviceLink = DeviceLinkAuthRepository::cancel,
                         onEmailBoundsChange = { emailFieldBounds = it },
@@ -318,31 +428,36 @@ fun AuthScreen(
                     )
                 } else {
                     AuthMobileLayout(
+                        showLoginScreen = showLoginScreen,
+                        verifiedPaidEmail = verifiedPaidEmail,
+                        isWaitingPayment = activeCheckoutSessionId != null && !showLoginScreen,
                         isSignUp = isSignUp,
                         email = email,
                         password = password,
                         passwordVisible = passwordVisible,
                         isLoading = isLoading,
-                        authError = authError,
+                        authError = effectiveError,
                         deviceLinkAuthState = deviceLinkAuthState,
                         deviceLinkEnabled = serverConnectionState.activeServer.capabilities.tvLogin,
                         statusBarTop = statusBarTop,
                         onEmailChange = {
-                            email = it
+                            if (verifiedPaidEmail == null) {
+                                email = it
+                            }
+                            localError = null
                             AuthRepository.clearError()
                         },
                         onPasswordChange = {
                             password = it
+                            localError = null
                             AuthRepository.clearError()
                         },
                         onPasswordVisibilityToggle = { passwordVisible = !passwordVisible },
                         onSubmit = ::submitAuth,
                         onToggleAuthMode = ::toggleAuthMode,
-                        onContinueWithoutAccount = {
-                            focusManager.clearFocus(force = true)
-                            DeviceLinkAuthRepository.cancel()
-                            AuthRepository.signInAnonymously()
-                        },
+                        onStartCheckout = ::startCheckout,
+                        onOpenExistingAccountLogin = ::openExistingAccountLogin,
+                        onReturnToPaywall = ::returnToPaywall,
                         onStartDeviceLink = ::startDeviceLink,
                         onCancelDeviceLink = DeviceLinkAuthRepository::cancel,
                         onEmailBoundsChange = { emailFieldBounds = it },
@@ -415,6 +530,9 @@ fun AuthScreen(
 
 @Composable
 private fun AuthMobileLayout(
+    showLoginScreen: Boolean,
+    verifiedPaidEmail: String?,
+    isWaitingPayment: Boolean,
     isSignUp: Boolean,
     email: String,
     password: String,
@@ -429,7 +547,9 @@ private fun AuthMobileLayout(
     onPasswordVisibilityToggle: () -> Unit,
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
-    onContinueWithoutAccount: () -> Unit,
+    onStartCheckout: () -> Unit,
+    onOpenExistingAccountLogin: () -> Unit,
+    onReturnToPaywall: () -> Unit,
     onStartDeviceLink: () -> Unit,
     onCancelDeviceLink: () -> Unit,
     onEmailBoundsChange: (Rect) -> Unit,
@@ -455,9 +575,11 @@ private fun AuthMobileLayout(
         ) {
             AuthBrandLockup(logoHeight = 38.dp)
 
-            Spacer(modifier = Modifier.height(64.dp))
+            Spacer(modifier = Modifier.height(48.dp))
 
             AuthHeading(
+                showLoginScreen = showLoginScreen,
+                verifiedPaidEmail = verifiedPaidEmail,
                 isSignUp = isSignUp,
                 headingStyle = MaterialTheme.typography.headlineLarge.copy(
                     color = AuthTextPrimary,
@@ -473,9 +595,12 @@ private fun AuthMobileLayout(
                 ),
             )
 
-            Spacer(modifier = Modifier.height(28.dp))
+            Spacer(modifier = Modifier.height(24.dp))
 
             AuthForm(
+                showLoginScreen = showLoginScreen,
+                verifiedPaidEmail = verifiedPaidEmail,
+                isWaitingPayment = isWaitingPayment,
                 isSignUp = isSignUp,
                 email = email,
                 password = password,
@@ -490,7 +615,9 @@ private fun AuthMobileLayout(
                 onPasswordVisibilityToggle = onPasswordVisibilityToggle,
                 onSubmit = onSubmit,
                 onToggleAuthMode = onToggleAuthMode,
-                onContinueWithoutAccount = onContinueWithoutAccount,
+                onStartCheckout = onStartCheckout,
+                onOpenExistingAccountLogin = onOpenExistingAccountLogin,
+                onReturnToPaywall = onReturnToPaywall,
                 onStartDeviceLink = onStartDeviceLink,
                 onCancelDeviceLink = onCancelDeviceLink,
                 onEmailBoundsChange = onEmailBoundsChange,
@@ -503,6 +630,9 @@ private fun AuthMobileLayout(
 @Composable
 private fun AuthLargeLayout(
     modifier: Modifier = Modifier,
+    showLoginScreen: Boolean,
+    verifiedPaidEmail: String?,
+    isWaitingPayment: Boolean,
     isSignUp: Boolean,
     email: String,
     password: String,
@@ -521,7 +651,9 @@ private fun AuthLargeLayout(
     onPasswordVisibilityToggle: () -> Unit,
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
-    onContinueWithoutAccount: () -> Unit,
+    onStartCheckout: () -> Unit,
+    onOpenExistingAccountLogin: () -> Unit,
+    onReturnToPaywall: () -> Unit,
     onStartDeviceLink: () -> Unit,
     onCancelDeviceLink: () -> Unit,
     onEmailBoundsChange: (Rect) -> Unit,
@@ -587,6 +719,8 @@ private fun AuthLargeLayout(
                     .padding(horizontal = formHorizontalPadding),
             ) {
                 AuthHeading(
+                    showLoginScreen = showLoginScreen,
+                    verifiedPaidEmail = verifiedPaidEmail,
                     isSignUp = isSignUp,
                     headingStyle = MaterialTheme.typography.headlineLarge.copy(
                         color = AuthTextPrimary,
@@ -602,9 +736,12 @@ private fun AuthLargeLayout(
                     ),
                 )
 
-                Spacer(modifier = Modifier.height(32.dp * scale))
+                Spacer(modifier = Modifier.height(28.dp * scale))
 
                 AuthForm(
+                    showLoginScreen = showLoginScreen,
+                    verifiedPaidEmail = verifiedPaidEmail,
+                    isWaitingPayment = isWaitingPayment,
                     isSignUp = isSignUp,
                     email = email,
                     password = password,
@@ -620,7 +757,9 @@ private fun AuthLargeLayout(
                     onPasswordVisibilityToggle = onPasswordVisibilityToggle,
                     onSubmit = onSubmit,
                     onToggleAuthMode = onToggleAuthMode,
-                    onContinueWithoutAccount = onContinueWithoutAccount,
+                    onStartCheckout = onStartCheckout,
+                    onOpenExistingAccountLogin = onOpenExistingAccountLogin,
+                    onReturnToPaywall = onReturnToPaywall,
                     onStartDeviceLink = onStartDeviceLink,
                     onCancelDeviceLink = onCancelDeviceLink,
                     onEmailBoundsChange = onEmailBoundsChange,
@@ -657,6 +796,8 @@ private fun AuthBrandLockup(
 
 @Composable
 private fun AuthHeading(
+    showLoginScreen: Boolean,
+    verifiedPaidEmail: String?,
     isSignUp: Boolean,
     headingStyle: TextStyle,
     subtitleStyle: TextStyle,
@@ -666,25 +807,33 @@ private fun AuthHeading(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         AnimatedContent(
-            targetState = isSignUp,
+            targetState = Triple(showLoginScreen, isSignUp, verifiedPaidEmail != null),
             transitionSpec = { fadeIn() togetherWith fadeOut() },
             label = "authHeading",
-        ) { signUp ->
+        ) { (loginVisible, signUp, isVerified) ->
             Text(
-                text = if (signUp) stringResource(Res.string.compose_auth_create_account)
-                else stringResource(Res.string.compose_auth_welcome_back),
+                text = when {
+                    !loginVisible -> "Acesso Exclusivo"
+                    signUp -> stringResource(Res.string.compose_auth_create_account)
+                    else -> stringResource(Res.string.compose_auth_welcome_back)
+                },
                 style = headingStyle,
                 color = AuthTextPrimary,
             )
         }
         AnimatedContent(
-            targetState = isSignUp,
+            targetState = Triple(showLoginScreen, isSignUp, verifiedPaidEmail != null),
             transitionSpec = { fadeIn() togetherWith fadeOut() },
             label = "authSubtitle",
-        ) { signUp ->
+        ) { (loginVisible, signUp, isVerified) ->
             Text(
-                text = if (signUp) stringResource(Res.string.compose_auth_sign_up_subtitle)
-                else stringResource(Res.string.compose_auth_sign_in_subtitle),
+                text = when {
+                    !loginVisible -> "Pague no site oficial para liberar automaticamente sua conta."
+                    isVerified && signUp -> "Pagamento aprovado! Agora crie uma senha para o seu Gmail."
+                    isVerified -> "Pagamento aprovado! Entre com a senha do seu Gmail."
+                    signUp -> "Informe o mesmo Gmail usado no pagamento PIX do site."
+                    else -> stringResource(Res.string.compose_auth_sign_in_subtitle)
+                },
                 style = subtitleStyle,
                 color = AuthTextSecondary,
             )
@@ -694,6 +843,9 @@ private fun AuthHeading(
 
 @Composable
 private fun AuthForm(
+    showLoginScreen: Boolean,
+    verifiedPaidEmail: String?,
+    isWaitingPayment: Boolean,
     isSignUp: Boolean,
     email: String,
     password: String,
@@ -709,30 +861,29 @@ private fun AuthForm(
     onPasswordVisibilityToggle: () -> Unit,
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
-    onContinueWithoutAccount: () -> Unit,
+    onStartCheckout: () -> Unit,
+    onOpenExistingAccountLogin: () -> Unit,
+    onReturnToPaywall: () -> Unit,
     onStartDeviceLink: () -> Unit,
     onCancelDeviceLink: () -> Unit,
     onEmailBoundsChange: (Rect) -> Unit,
     onPasswordBoundsChange: (Rect) -> Unit,
 ) {
-    var showLoginScreen by rememberSaveable { mutableStateOf(false) }
     Column(
         modifier = Modifier.fillMaxWidth(),
     ) {
         if (!showLoginScreen) {
-            val uriHandler = LocalUriHandler.current
             AppPaywallPreCheckoutSection(
                 scale = scale,
                 primaryHeight = metrics.primaryHeight,
-                secondaryHeight = metrics.secondaryHeight,
-                onGoToCheckout = {
-                    uriHandler.openUri(com.nuvio.app.core.network.CineBackendConfig.checkoutUrl)
-                },
-                onGoToLogin = { showLoginScreen = true },
+                isWaitingPayment = isWaitingPayment,
+                authError = authError,
+                onGoToCheckout = onStartCheckout,
+                onOpenExistingAccountLogin = onOpenExistingAccountLogin,
             )
         } else {
             TextButton(
-                onClick = { showLoginScreen = false },
+                onClick = onReturnToPaywall,
                 modifier = Modifier.align(Alignment.Start),
             ) {
                 Text(
@@ -744,7 +895,27 @@ private fun AuthForm(
                 )
             }
 
-            Spacer(modifier = Modifier.height(6.dp * scale))
+            if (verifiedPaidEmail != null) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFF22C55E).copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+                ) {
+                    Text(
+                        text = "✓ Pagamento PIX aprovado! O mesmo Gmail do site foi preenchido abaixo.",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFF4ADE80),
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = (12.5f * scale).sp,
+                        ),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    )
+                }
+                Spacer(modifier = Modifier.height(12.dp * scale))
+            } else {
+                Spacer(modifier = Modifier.height(6.dp * scale))
+            }
 
             AuthTextField(
                 value = email,
@@ -753,6 +924,7 @@ private fun AuthForm(
                 icon = Icons.Rounded.Email,
                 metrics = metrics,
                 scale = scale,
+                readOnly = verifiedPaidEmail != null,
                 modifier = Modifier.onGloballyPositioned { coordinates ->
                     onEmailBoundsChange(coordinates.boundsInRoot())
                 },
@@ -825,7 +997,7 @@ private fun AuthForm(
                 enabled = !isLoading,
                 height = metrics.secondaryHeight,
                 scale = scale,
-                onClick = { showLoginScreen = false },
+                onClick = onReturnToPaywall,
             )
         }
 
@@ -854,6 +1026,7 @@ private fun AuthTextField(
     metrics: AuthFormMetrics,
     scale: Float,
     modifier: Modifier = Modifier,
+    readOnly: Boolean = false,
     isPassword: Boolean = false,
     passwordVisible: Boolean = false,
     onPasswordVisibilityToggle: () -> Unit = {},
@@ -866,7 +1039,11 @@ private fun AuthTextField(
             .fillMaxWidth()
             .height(metrics.fieldHeight)
             .background(metrics.fieldBackground, shape)
-            .border(1.dp, AuthFieldBorder, shape)
+            .border(
+                1.dp,
+                if (readOnly) Color(0xFF22C55E).copy(alpha = 0.55f) else AuthFieldBorder,
+                shape,
+            )
             .padding(horizontal = metrics.fieldHorizontalPadding),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -874,7 +1051,7 @@ private fun AuthTextField(
             imageVector = icon,
             contentDescription = null,
             modifier = Modifier.size(metrics.iconSize),
-            tint = AuthTextMuted,
+            tint = if (readOnly) Color(0xFF4ADE80) else AuthTextMuted,
         )
         Spacer(modifier = Modifier.width(12.dp))
         BasicTextField(
@@ -883,6 +1060,7 @@ private fun AuthTextField(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxHeight(),
+            readOnly = readOnly,
             singleLine = true,
             textStyle = MaterialTheme.typography.bodyLarge.copy(
                 color = AuthTextPrimary,
@@ -1165,100 +1343,172 @@ private fun LayoutCoordinates.boundsInRoot(): Rect {
 private fun AppPaywallPreCheckoutSection(
     scale: Float,
     primaryHeight: Dp,
-    secondaryHeight: Dp,
+    isWaitingPayment: Boolean,
+    authError: String?,
     onGoToCheckout: () -> Unit,
-    onGoToLogin: () -> Unit,
+    onOpenExistingAccountLogin: () -> Unit,
 ) {
-    Surface(
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        color = Color(0xFF131722),
-        border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(20.dp * scale),
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            color = Color(0xFF131722),
+            border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
         ) {
-            Surface(
-                shape = RoundedCornerShape(999.dp),
-                color = Color(0xFF22C55E).copy(alpha = 0.12f),
-                border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
-            ) {
-                Text(
-                    text = "🔒 ACESSO RESTRITO POR ASSINATURA",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        color = Color(0xFF4ADE80),
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 0.5.sp,
-                        fontSize = (11f * scale).sp,
-                    ),
-                    modifier = Modifier.padding(horizontal = 10.dp * scale, vertical = 5.dp * scale),
-                )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp * scale))
-
-            Text(
-                text = "Libere o Acesso ao Cine Ultimate",
-                style = MaterialTheme.typography.titleLarge.copy(
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = (20f * scale).sp,
-                ),
-            )
-
-            Spacer(modifier = Modifier.height(6.dp * scale))
-
-            Text(
-                text = "Para assistir a milhares de filmes, séries, canais ao vivo em 4K e curtir a Sala Cinema 3D, realize o pagamento único de R$ 10,00 no site oficial.",
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    color = Color(0xFF94A3B8),
-                    fontSize = (13f * scale).sp,
-                    lineHeight = (19f * scale).sp,
-                ),
-            )
-
-            Spacer(modifier = Modifier.height(16.dp * scale))
-
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp * scale)) {
-                PaywallBenefitItem("✓ Pagamento Único de R$ 10,00 (Sem mensalidade)", scale)
-                PaywallBenefitItem("✓ Canais Ao Vivo 4K & Full HD", scale)
-                PaywallBenefitItem("✓ Catálogo completo de Filmes e Séries", scale)
-                PaywallBenefitItem("✓ Sala Cinema 3D com som imersivo", scale)
-                PaywallBenefitItem("✓ Liberação imediata após o PIX no site", scale)
-            }
-
-            Spacer(modifier = Modifier.height(20.dp * scale))
-
-            Button(
-                onClick = onGoToCheckout,
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(primaryHeight),
-                shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF22C55E),
-                    contentColor = Color.White,
-                ),
+                    .padding(20.dp * scale),
             ) {
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = Color(0xFF22C55E).copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+                ) {
+                    Text(
+                        text = "🔒 ACESSO RESTRITO POR ASSINATURA",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = Color(0xFF4ADE80),
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.5.sp,
+                            fontSize = (11f * scale).sp,
+                        ),
+                        modifier = Modifier.padding(horizontal = 10.dp * scale, vertical = 5.dp * scale),
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(14.dp * scale))
+
                 Text(
-                    text = "⚡ Pagar R$ 10,00 no Site e Liberar",
-                    style = MaterialTheme.typography.titleMedium.copy(
+                    text = "Libere o Acesso ao Cine Ultimate",
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        color = Color.White,
                         fontWeight = FontWeight.Bold,
-                        fontSize = (15f * scale).sp,
+                        fontSize = (20f * scale).sp,
                     ),
                 )
+
+                Spacer(modifier = Modifier.height(6.dp * scale))
+
+                Text(
+                    text = "Para assistir a milhares de filmes, séries, canais ao vivo em 4K e curtir a Sala Cinema 3D, realize o pagamento único de R$ 10,00 no site oficial.",
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        color = Color(0xFF94A3B8),
+                        fontSize = (13f * scale).sp,
+                        lineHeight = (19f * scale).sp,
+                    ),
+                )
+
+                Spacer(modifier = Modifier.height(16.dp * scale))
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp * scale)) {
+                    PaywallBenefitItem("✓ Pagamento Único de R$ 10,00 (Sem mensalidade)", scale)
+                    PaywallBenefitItem("✓ Canais Ao Vivo 4K & Full HD", scale)
+                    PaywallBenefitItem("✓ Catálogo completo de Filmes e Séries", scale)
+                    PaywallBenefitItem("✓ Sala Cinema 3D com som imersivo", scale)
+                    PaywallBenefitItem("✓ Liberação automática após o PIX no site", scale)
+                }
+
+                Spacer(modifier = Modifier.height(16.dp * scale))
+
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFFF59E0B).copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, Color(0xFFF59E0B).copy(alpha = 0.4f)),
+                ) {
+                    Text(
+                        text = "⚠️ Importante: Use o mesmo Gmail do pagamento no site para liberar automaticamente sua conta no app.",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFFFDE68A),
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = (12.5f * scale).sp,
+                            lineHeight = (18f * scale).sp,
+                        ),
+                        modifier = Modifier.padding(horizontal = 12.dp * scale, vertical = 10.dp * scale),
+                    )
+                }
+
+                if (isWaitingPayment) {
+                    Spacer(modifier = Modifier.height(14.dp * scale))
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0xFF22C55E).copy(alpha = 0.10f),
+                        border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp * scale, vertical = 10.dp * scale),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp * scale),
+                        ) {
+                            NuvioLoadingIndicator(
+                                size = 20.dp * scale,
+                                color = Color(0xFF4ADE80),
+                            )
+                            Text(
+                                text = "⏳ Aguardando confirmação automática do PIX... Após pagar no site, esta tela abrirá sozinha para criar sua senha.",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = Color(0xFFBBF7D0),
+                                    fontSize = (12.5f * scale).sp,
+                                    lineHeight = (18f * scale).sp,
+                                ),
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+
+                authError?.let { errorText ->
+                    Spacer(modifier = Modifier.height(12.dp * scale))
+                    Text(
+                        text = errorText,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            color = MaterialTheme.colorScheme.error,
+                            fontSize = (13f * scale).sp,
+                            lineHeight = (18f * scale).sp,
+                        ),
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(18.dp * scale))
+
+                Button(
+                    onClick = onGoToCheckout,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(primaryHeight),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF22C55E),
+                        contentColor = Color.White,
+                    ),
+                ) {
+                    Text(
+                        text = if (isWaitingPayment) "🌐 Reabrir Site de Pagamento PIX" else "⚡ Pagar R$ 10,00 no Site e Liberar",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            fontSize = (15f * scale).sp,
+                        ),
+                    )
+                }
             }
+        }
 
-            Spacer(modifier = Modifier.height(12.dp * scale))
+        Spacer(modifier = Modifier.height(10.dp * scale))
 
-            AuthSecondaryButton(
-                text = "Já paguei no site / Fazer Login →",
-                enabled = true,
-                height = secondaryHeight,
-                scale = scale,
-                onClick = onGoToLogin,
+        TextButton(onClick = onOpenExistingAccountLogin) {
+            Text(
+                text = "Já possui conta e senha cadastradas? Fazer Login",
+                style = MaterialTheme.typography.bodySmall.copy(
+                    color = AuthTextSecondary,
+                    fontSize = (13f * scale).sp,
+                ),
             )
         }
     }

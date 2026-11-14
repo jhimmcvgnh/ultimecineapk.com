@@ -300,37 +300,25 @@ internal fun AppGate(
     }
 
     LaunchedEffect(authState, networkStatusUiState.condition, profileState.profiles) {
-        val cachedProfiles = profileState.profiles
-        val hasCachedProfileAccess =
-            cachedProfiles.isNotEmpty() &&
-                authState !is AuthState.Authenticated
-        val allowCachedProfileAccess =
-            hasCachedProfileAccess &&
-                (
-                    networkStatusUiState.condition != NetworkCondition.Online ||
-                        gateScreen != AppGateScreen.Auth.name
-                )
-
         when (authState) {
             is AuthState.Loading -> {
-                if (hasCachedProfileAccess) {
-                    enterProfileGate(cachedProfiles, syncOnEnter = false)
-                } else {
-                    gateScreen = AppGateScreen.Loading.name
-                }
+                gateScreen = AppGateScreen.Loading.name
             }
             is AuthState.Unauthenticated -> {
-                if (allowCachedProfileAccess) {
-                    enterProfileGate(cachedProfiles, syncOnEnter = false)
-                } else {
+                ProfileRepository.clearInMemory()
+                profileSelectionLoading = false
+                profileSelectionTransitionActive = false
+                gateScreen = AppGateScreen.Auth.name
+            }
+            is AuthState.Authenticated -> {
+                val authenticatedState = authState as AuthState.Authenticated
+                if (authenticatedState.isAnonymous || authenticatedState.email.isNullOrBlank()) {
                     ProfileRepository.clearInMemory()
                     profileSelectionLoading = false
                     profileSelectionTransitionActive = false
                     gateScreen = AppGateScreen.Auth.name
+                    return@LaunchedEffect
                 }
-            }
-            is AuthState.Authenticated -> {
-                val authenticatedState = authState as AuthState.Authenticated
                 ProfileRepository.ensureLoaded(authenticatedState.userId)
                 if (gateScreen == AppGateScreen.Loading.name || gateScreen == AppGateScreen.Auth.name) {
                     enterProfileGate(ProfileRepository.state.value.profiles, syncOnEnter = true)
@@ -341,6 +329,7 @@ internal fun AppGate(
 
     LaunchedEffect((authState as? AuthState.Authenticated)?.userId) {
         val authenticatedState = authState as? AuthState.Authenticated ?: return@LaunchedEffect
+        if (authenticatedState.isAnonymous || authenticatedState.email.isNullOrBlank()) return@LaunchedEffect
         ProfileRepository.ensureLoaded(authenticatedState.userId)
         ProfileRepository.pullProfiles()
     }
