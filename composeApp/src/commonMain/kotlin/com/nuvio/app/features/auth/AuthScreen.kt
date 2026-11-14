@@ -87,8 +87,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.auth.AuthRepository
 import com.nuvio.app.core.auth.CineAuthClient
+import com.nuvio.app.core.auth.CineSessionPersistence
 import com.nuvio.app.core.auth.DeviceLinkAuthRepository
 import com.nuvio.app.core.auth.DeviceLinkAuthState
+import com.nuvio.app.core.auth.PersistedPaymentState
 import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.core.deeplink.AppDeepLink
 import com.nuvio.app.core.deeplink.AppDeepLinkRepository
@@ -208,20 +210,38 @@ fun AuthScreen(
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val uriHandler = LocalUriHandler.current
+    val initialPaymentState = remember { CineSessionPersistence.loadPaymentState() }
 
-    var showLoginScreen by rememberSaveable { mutableStateOf(false) }
-    var verifiedPaidEmail by rememberSaveable { mutableStateOf<String?>(null) }
-    var activeCheckoutSessionId by rememberSaveable { mutableStateOf<String?>(null) }
-    var confirmedPaidEmail by rememberSaveable { mutableStateOf<String?>(null) }
-    var confirmedPaidHasAccount by rememberSaveable { mutableStateOf(false) }
-    var confirmedPaymentId by rememberSaveable { mutableStateOf<String?>(null) }
-    var manualCheckEmail by rememberSaveable { mutableStateOf("") }
+    var showLoginScreen by rememberSaveable {
+        mutableStateOf(!initialPaymentState?.verifiedPaidEmail.isNullOrBlank())
+    }
+    var verifiedPaidEmail by rememberSaveable { mutableStateOf(initialPaymentState?.verifiedPaidEmail) }
+    var activeCheckoutSessionId by rememberSaveable {
+        mutableStateOf(
+            initialPaymentState?.pendingCheckoutSessionId
+                ?: initialPaymentState?.confirmedPaidEmail?.let { "chk_restored" },
+        )
+    }
+    var confirmedPaidEmail by rememberSaveable { mutableStateOf(initialPaymentState?.confirmedPaidEmail) }
+    var confirmedPaidHasAccount by rememberSaveable {
+        mutableStateOf(initialPaymentState?.confirmedPaidHasAccount ?: false)
+    }
+    var confirmedPaymentId by rememberSaveable { mutableStateOf(initialPaymentState?.confirmedPaymentId) }
+    var manualCheckEmail by rememberSaveable { mutableStateOf(initialPaymentState?.confirmedPaidEmail.orEmpty()) }
     var showManualEmailFallback by rememberSaveable { mutableStateOf(false) }
     var isConfirmingPayment by rememberSaveable { mutableStateOf(false) }
     var localError by rememberSaveable { mutableStateOf<String?>(null) }
 
-    var isSignUp by rememberSaveable { mutableStateOf(true) }
-    var email by rememberSaveable { mutableStateOf("") }
+    var isSignUp by rememberSaveable {
+        mutableStateOf(
+            if (!initialPaymentState?.verifiedPaidEmail.isNullOrBlank()) {
+                initialPaymentState?.isSignUpMode ?: true
+            } else {
+                true
+            },
+        )
+    }
+    var email by rememberSaveable { mutableStateOf(initialPaymentState?.verifiedPaidEmail.orEmpty()) }
     var password by rememberSaveable { mutableStateOf("") }
     var passwordVisible by rememberSaveable { mutableStateOf(false) }
     var isLoading by rememberSaveable { mutableStateOf(false) }
@@ -232,18 +252,48 @@ fun AuthScreen(
 
     val effectiveError = localError ?: authError
 
+    fun syncPersistedPaymentState(
+        pendingSessionId: String? = activeCheckoutSessionId?.takeUnless { it == "chk_restored" || it == "chk_deeplink" },
+        paidEmail: String? = confirmedPaidEmail,
+        hasAccount: Boolean = confirmedPaidHasAccount,
+        paymentId: String? = confirmedPaymentId,
+        verifiedEmail: String? = verifiedPaidEmail,
+        signUpMode: Boolean = isSignUp,
+    ) {
+        CineSessionPersistence.savePaymentState(
+            PersistedPaymentState(
+                pendingCheckoutSessionId = pendingSessionId,
+                confirmedPaidEmail = paidEmail,
+                confirmedPaidHasAccount = hasAccount,
+                confirmedPaymentId = paymentId,
+                verifiedPaidEmail = verifiedEmail,
+                isSignUpMode = signUpMode,
+            ),
+        )
+    }
+
     fun unlockWithConfirmedPayment(approvedEmail: String, hasExistingAccount: Boolean) {
-        email = approvedEmail
-        verifiedPaidEmail = approvedEmail
-        isSignUp = !hasExistingAccount
+        val cleanEmail = approvedEmail.trim().lowercase()
+        val nextSignUpMode = !hasExistingAccount
+        email = cleanEmail
+        verifiedPaidEmail = cleanEmail
+        isSignUp = nextSignUpMode
         activeCheckoutSessionId = null
-        confirmedPaidEmail = null
-        confirmedPaymentId = null
+        confirmedPaidEmail = cleanEmail
+        confirmedPaidHasAccount = hasExistingAccount
         showManualEmailFallback = false
         isConfirmingPayment = false
         localError = null
         AuthRepository.clearError()
         showLoginScreen = true
+        syncPersistedPaymentState(
+            pendingSessionId = null,
+            paidEmail = cleanEmail,
+            hasAccount = hasExistingAccount,
+            paymentId = confirmedPaymentId,
+            verifiedEmail = cleanEmail,
+            signUpMode = nextSignUpMode,
+        )
     }
 
     LaunchedEffect(pendingDeepLink) {
@@ -273,6 +323,11 @@ fun AuthScreen(
                         if (manualCheckEmail.isBlank()) {
                             manualCheckEmail = info.email
                         }
+                        syncPersistedPaymentState(
+                            paidEmail = info.email,
+                            hasAccount = info.hasAccount,
+                            paymentId = deepLink.paymentId,
+                        )
                     } else {
                         localError = "Acesso negado: O Gmail $paidEmail ainda não possui pagamento PIX de R$ 10,00 aprovado."
                         showLoginScreen = false
@@ -287,7 +342,14 @@ fun AuthScreen(
 
     LaunchedEffect(activeCheckoutSessionId, showLoginScreen, confirmedPaidEmail, appVisibility) {
         val sessionId = activeCheckoutSessionId ?: return@LaunchedEffect
-        if (showLoginScreen || confirmedPaidEmail != null || sessionId == "chk_deeplink") return@LaunchedEffect
+        if (
+            showLoginScreen ||
+            confirmedPaidEmail != null ||
+            sessionId == "chk_deeplink" ||
+            sessionId == "chk_restored"
+        ) {
+            return@LaunchedEffect
+        }
 
         repeat(600) { attempt ->
             if (attempt > 0) {
@@ -304,6 +366,11 @@ fun AuthScreen(
                 confirmedPaidHasAccount = status.hasAccount
                 localError = null
                 AuthRepository.clearError()
+                syncPersistedPaymentState(
+                    pendingSessionId = sessionId,
+                    paidEmail = status.email,
+                    hasAccount = status.hasAccount,
+                )
                 return@LaunchedEffect
             }
         }
@@ -326,8 +393,17 @@ fun AuthScreen(
         confirmedPaidEmail = null
         confirmedPaidHasAccount = false
         confirmedPaymentId = null
+        verifiedPaidEmail = null
         showManualEmailFallback = false
         isConfirmingPayment = false
+        syncPersistedPaymentState(
+            pendingSessionId = sessionId,
+            paidEmail = null,
+            hasAccount = false,
+            paymentId = null,
+            verifiedEmail = null,
+            signUpMode = true,
+        )
         uriHandler.openUri("${CineBackendConfig.checkoutUrl}?session=$sessionId")
     }
 
@@ -347,7 +423,7 @@ fun AuthScreen(
         isConfirmingPayment = true
         scope.launch {
             val sessionStatus = sessionId
-                ?.takeIf { it != "chk_deeplink" }
+                ?.takeIf { it != "chk_deeplink" && it != "chk_restored" }
                 ?.let { CineAuthClient.checkSessionStatus(it).getOrNull() }
             if (sessionStatus != null && sessionStatus.approved && sessionStatus.email.isNotBlank()) {
                 unlockWithConfirmedPayment(sessionStatus.email, sessionStatus.hasAccount)
@@ -379,7 +455,6 @@ fun AuthScreen(
         localError = null
         AuthRepository.clearError()
         verifiedPaidEmail = null
-        confirmedPaidEmail = null
         isConfirmingPayment = false
         isSignUp = false
         showLoginScreen = true
@@ -388,21 +463,35 @@ fun AuthScreen(
     fun returnToPaywall() {
         localError = null
         AuthRepository.clearError()
+        val preservedEmail = confirmedPaidEmail ?: verifiedPaidEmail
         verifiedPaidEmail = null
-        confirmedPaidEmail = null
+        confirmedPaidEmail = preservedEmail
+        if (preservedEmail != null && activeCheckoutSessionId == null) {
+            activeCheckoutSessionId = "chk_restored"
+        }
         isConfirmingPayment = false
         showLoginScreen = false
+        syncPersistedPaymentState(
+            paidEmail = preservedEmail,
+            verifiedEmail = null,
+        )
     }
 
     fun submitAuth() {
-        if (email.isBlank() || password.length < 6 || isLoading) return
+        val cleanEmail = email.trim().lowercase()
+        if (cleanEmail.isBlank() || password.length < 6 || isLoading) {
+            if (password.length in 1..5) {
+                localError = "Escolha uma senha com pelo menos 6 caracteres para sua conta Host."
+            }
+            return
+        }
         localError = null
         DeviceLinkAuthRepository.cancel()
         isLoading = true
         focusManager.clearFocus(force = true)
         scope.launch {
-            if (isSignUp) AuthRepository.signUpWithEmail(email, password)
-            else AuthRepository.signInWithEmail(email, password)
+            if (isSignUp) AuthRepository.signUpWithEmail(cleanEmail, password)
+            else AuthRepository.signInWithEmail(cleanEmail, password)
             isLoading = false
         }
     }
@@ -1048,11 +1137,16 @@ private fun AuthForm(
                     border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
                 ) {
                     Text(
-                        text = "✓ Pagamento PIX aprovado! O mesmo Gmail do site foi preenchido abaixo.",
+                        text = if (isSignUp) {
+                            "✓ PIX de R$ 10,00 aprovado! Crie sua Conta Principal (Host) com o mesmo Gmail da compra ($verifiedPaidEmail) e escolha sua senha. Depois você poderá criar vários perfis."
+                        } else {
+                            "✓ PIX já aprovado para $verifiedPaidEmail! Esta conta Host já possui cadastro — entre com sua senha abaixo."
+                        },
                         style = MaterialTheme.typography.bodySmall.copy(
                             color = Color(0xFF4ADE80),
                             fontWeight = FontWeight.SemiBold,
                             fontSize = (12.5f * scale).sp,
+                            lineHeight = (18f * scale).sp,
                         ),
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                     )
@@ -1065,11 +1159,11 @@ private fun AuthForm(
             AuthTextField(
                 value = email,
                 onValueChange = onEmailChange,
-                placeholder = stringResource(Res.string.compose_auth_email),
+                placeholder = if (isSignUp) "Gmail usado na compra PIX" else stringResource(Res.string.compose_auth_email),
                 icon = Icons.Rounded.Email,
                 metrics = metrics,
                 scale = scale,
-                readOnly = verifiedPaidEmail != null,
+                readOnly = false,
                 modifier = Modifier.onGloballyPositioned { coordinates ->
                     onEmailBoundsChange(coordinates.boundsInRoot())
                 },
@@ -1118,8 +1212,11 @@ private fun AuthForm(
             Spacer(modifier = Modifier.height(metrics.primaryTop))
 
             AuthPrimaryButton(
-                text = if (isSignUp) stringResource(Res.string.compose_auth_create_account)
-                else stringResource(Res.string.compose_auth_sign_in),
+                text = when {
+                    isSignUp && verifiedPaidEmail != null -> "Criar Conta Principal (Host)"
+                    isSignUp -> stringResource(Res.string.compose_auth_create_account)
+                    else -> stringResource(Res.string.compose_auth_sign_in)
+                },
                 isLoading = isLoading,
                 enabled = !isLoading,
                 height = metrics.primaryHeight,

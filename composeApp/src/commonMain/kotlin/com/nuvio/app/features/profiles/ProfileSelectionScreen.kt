@@ -173,10 +173,23 @@ fun ProfileSelectionScreen(
                     },
                 )
 
-                Spacer(modifier = Modifier.height(if (isTabletLayout) 28.dp else 48.dp))
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Text(
+                    text = "Conta Host ativa • Escolha seu perfil ou toque em + para adicionar mais usuários",
+                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.5.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.graphicsLayer {
+                        alpha = titleAlpha.value
+                        translationY = titleOffset.value
+                    },
+                )
+
+                Spacer(modifier = Modifier.height(if (isTabletLayout) 28.dp else 40.dp))
 
                 val profiles = profileState.profiles
-                val items = profiles.size + if (isEditMode && profiles.size < MAX_PROFILES) 1 else 0
+                val items = profiles.size + if (profiles.size < MAX_PROFILES) 1 else 0
 
                 if (isTabletLayout) {
                     Box(
@@ -480,6 +493,24 @@ private fun ProfileAvatarCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+
+        if (profile.profileIndex == 1) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
+                    .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    text = "HOST",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
     }
 }
 

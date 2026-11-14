@@ -271,8 +271,14 @@ internal fun AppGate(
     fun enterProfileGate(profiles: List<NuvioProfile>, syncOnEnter: Boolean) {
         profileSelectionLoading = false
         profileSelectionTransitionActive = false
-        if (profiles.isEmpty()) {
-            autoSkipProfileSelection = true
+        val authUserId = (authState as? AuthState.Authenticated)?.userId.orEmpty()
+        val justCreatedAccount = authUserId.isNotBlank() &&
+            com.nuvio.app.core.auth.CineSessionPersistence.consumeAccountJustCreated(authUserId)
+        val hasEverSelected = ProfileRepository.state.value.hasEverSelectedProfile
+
+        if (profiles.isEmpty() || justCreatedAccount || !hasEverSelected) {
+            // Conta nova ou primeiro acesso após cadastro: sempre mostra a tela de perfis Host + Adicionar Perfis
+            autoSkipProfileSelection = false
             gateScreen = AppGateScreen.ProfileSelection.name
             return
         }
@@ -284,10 +290,10 @@ internal fun AppGate(
             return
         }
 
-        autoSkipProfileSelection = true
         if (profiles.size == 1) {
             val onlyProfile = profiles.first()
             if (onlyProfile.pinEnabled) {
+                autoSkipProfileSelection = false
                 gateScreen = AppGateScreen.ProfileSelection.name
                 return
             }
@@ -295,6 +301,7 @@ internal fun AppGate(
             gateScreen = AppGateScreen.Main.name
             autoSkipProfileSelection = false
         } else {
+            autoSkipProfileSelection = false
             gateScreen = AppGateScreen.ProfileSelection.name
         }
     }
@@ -513,7 +520,7 @@ internal fun AppGate(
                 .zIndex(NuvioTokens.Z.dialog),
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
-                val onBack: (() -> Unit)? = if (!autoSkipProfileSelection) {
+                val onBack: (() -> Unit)? = if (renderMainContent) {
                     {
                         skipProfileSelectionEnterAnimation = false
                         gateScreen = AppGateScreen.Main.name
@@ -530,7 +537,7 @@ internal fun AppGate(
                     onProfileSelected = { profile ->
                         if (
                             !profileSelectionLoading &&
-                            (autoSkipProfileSelection || profile.profileIndex != ProfileRepository.state.value.activeProfile?.profileIndex)
+                            (!renderMainContent || profile.profileIndex != ProfileRepository.state.value.activeProfile?.profileIndex)
                         ) {
                             profileSelectionLoading = true
                             profileSelectionTransitionActive = true
@@ -557,7 +564,7 @@ internal fun AppGate(
                     },
                     interactionEnabled = !profileSelectionLoading,
                     onBack = onBack,
-                    activeProfileIndex = if (autoSkipProfileSelection) null else profileState.activeProfile?.profileIndex,
+                    activeProfileIndex = if (renderMainContent) profileState.activeProfile?.profileIndex else null,
                     contentVisible = !profileSelectionTransitionActive,
                     modifier = Modifier.fillMaxSize(),
                 )

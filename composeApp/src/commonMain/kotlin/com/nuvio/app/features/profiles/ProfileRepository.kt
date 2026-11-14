@@ -3,7 +3,9 @@ package com.nuvio.app.features.profiles
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.auth.AuthRepository
 import com.nuvio.app.core.auth.AuthState
+import com.nuvio.app.core.auth.CineAuthClient
 import com.nuvio.app.core.auth.isAnonymous
+import com.nuvio.app.core.network.ServerConfigurationRepository
 import com.nuvio.app.core.network.SupabaseProvider
 import com.nuvio.app.core.poster.CustomPosterUrlRepository
 import com.nuvio.app.core.sync.ProfileSettingsSync
@@ -50,8 +52,11 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.put
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.StringResource
@@ -121,33 +126,123 @@ object ProfileRepository {
         _state.value = ProfileState()
     }
 
+    private fun buildDefaultHostProfile(authState: AuthState.Authenticated): NuvioProfile {
+        val emailPrefix = authState.email
+            ?.substringBefore('@')
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?.replaceFirstChar { it.uppercase() }
+            ?.take(18)
+        return NuvioProfile(
+            id = "host_${authState.userId.take(12)}",
+            userId = authState.userId,
+            profileIndex = 1,
+            name = emailPrefix ?: "Principal",
+            avatarColorHex = PROFILE_COLORS.first(),
+        )
+    }
+
+    private suspend fun fetchCloudMetadataProfiles(): Pair<Boolean, List<NuvioProfile>> {
+        var token = AuthRepository.currentAccessToken()
+            ?: AuthRepository.refreshAccessToken()
+            ?: return false to emptyList()
+
+        var userRes = CineAuthClient.fetchSupabaseUser(token)
+        if (userRes.isFailure) {
+            val refreshed = AuthRepository.refreshAccessToken()
+            if (!refreshed.isNullOrBlank() && refreshed != token) {
+                token = refreshed
+                userRes = CineAuthClient.fetchSupabaseUser(token)
+            }
+        }
+        val user = userRes.getOrNull() ?: return false to emptyList()
+        val rawArray = user.user_metadata?.get("cine_profiles") as? JsonArray ?: return true to emptyList()
+        val decoded = rawArray.mapNotNull { element ->
+            runCatching { json.decodeFromJsonElement<NuvioProfile>(element) }.getOrNull()
+        }.map { p ->
+            p.copy(userId = user.id.ifBlank { p.userId })
+        }.sortedBy { it.profileIndex }
+        return true to decoded
+    }
+
+    private suspend fun saveCloudMetadataProfiles(profiles: List<NuvioProfile>) {
+        var token = AuthRepository.currentAccessToken()
+            ?: AuthRepository.refreshAccessToken()
+            ?: return
+
+        val encodedArray = json.encodeToJsonElement(profiles).jsonArray
+        var saveRes = CineAuthClient.saveSupabaseProfilesMetadata(token, encodedArray)
+        if (saveRes.isFailure) {
+            val refreshed = AuthRepository.refreshAccessToken()
+            if (!refreshed.isNullOrBlank() && refreshed != token) {
+                token = refreshed
+                saveRes = CineAuthClient.saveSupabaseProfilesMetadata(token, encodedArray)
+            }
+        }
+        saveRes.onFailure { e ->
+            log.w(e) { "Failed to sync profiles to cloud metadata; preserved locally" }
+        }
+    }
+
     suspend fun pullProfiles() {
-        if (AuthRepository.state.value.isAnonymous) {
+        val authState = AuthRepository.state.value
+        if (authState.isAnonymous || authState !is AuthState.Authenticated) {
             if (!_state.value.isLoaded) {
                 _state.value = _state.value.copy(isLoaded = true)
             }
             return
         }
-        try {
-            val result = SupabaseProvider.client.postgrest.rpc("sync_pull_profiles")
-            val profiles = result.decodeList<NuvioProfile>()
-            _state.value = _state.value.copy(
-                profiles = profiles.sortedBy { it.profileIndex },
-                isLoaded = true,
-                activeProfile = profiles.find { it.profileIndex == activeProfileIndex }
-                    ?: profiles.firstOrNull(),
-            )
-            if (_state.value.activeProfile != null) {
-                activeProfileIndex = _state.value.activeProfile!!.profileIndex
+
+        if (ServerConfigurationRepository.active.value.isCustom) {
+            try {
+                val result = SupabaseProvider.client.postgrest.rpc("sync_pull_profiles")
+                val profiles = result.decodeList<NuvioProfile>().sortedBy { it.profileIndex }
+                _state.value = _state.value.copy(
+                    profiles = profiles,
+                    isLoaded = true,
+                    activeProfile = profiles.find { it.profileIndex == activeProfileIndex }
+                        ?: profiles.firstOrNull(),
+                )
+                if (_state.value.activeProfile != null) {
+                    activeProfileIndex = _state.value.activeProfile!!.profileIndex
+                }
+                persist()
+            } catch (e: Throwable) {
+                if (AuthRepository.signOutIfSessionInvalid(e, "Profile pull")) return
+                log.e(e) { "Failed to pull custom-server profiles" }
+                if (!_state.value.isLoaded) {
+                    _state.value = _state.value.copy(isLoaded = true)
+                }
             }
-            persist()
-        } catch (e: Throwable) {
-            if (AuthRepository.signOutIfSessionInvalid(e, "Profile pull")) return
-            log.e(e) { "Failed to pull profiles" }
-            if (!_state.value.isLoaded) {
-                _state.value = _state.value.copy(isLoaded = true)
-            }
+            return
         }
+
+        val (fetchedOk, cloudProfiles) = fetchCloudMetadataProfiles()
+        val resolvedProfiles = when {
+            cloudProfiles.isNotEmpty() -> cloudProfiles
+            _state.value.profiles.isNotEmpty() -> {
+                if (fetchedOk) {
+                    saveCloudMetadataProfiles(_state.value.profiles)
+                }
+                _state.value.profiles
+            }
+            else -> {
+                val hostProfile = buildDefaultHostProfile(authState)
+                listOf(hostProfile).also { initial ->
+                    saveCloudMetadataProfiles(initial)
+                }
+            }
+        }.sortedBy { it.profileIndex }
+
+        _state.value = _state.value.copy(
+            profiles = resolvedProfiles,
+            isLoaded = true,
+            activeProfile = resolvedProfiles.find { it.profileIndex == activeProfileIndex }
+                ?: resolvedProfiles.firstOrNull(),
+        )
+        _state.value.activeProfile?.let { activeProfileIndex = it.profileIndex }
+        syncPinCache(resolvedProfiles)
+        persist()
     }
 
     fun selectProfile(profileIndex: Int) {
@@ -195,8 +290,11 @@ object ProfileRepository {
     }
 
     suspend fun pushProfiles(profiles: List<ProfilePushPayload>) {
-        if (AuthRepository.state.value.isAnonymous) {
+        if (AuthRepository.state.value.isAnonymous || !ServerConfigurationRepository.active.value.isCustom) {
             applyPayloadsLocally(profiles)
+            if (!AuthRepository.state.value.isAnonymous) {
+                saveCloudMetadataProfiles(_state.value.profiles)
+            }
             return
         }
         try {
@@ -288,7 +386,8 @@ object ProfileRepository {
     }
 
     suspend fun deleteProfile(profileIndex: Int) {
-        if (AuthRepository.state.value.isAnonymous) {
+        if (profileIndex <= 1 && !ServerConfigurationRepository.active.value.isCustom) return
+        if (AuthRepository.state.value.isAnonymous || !ServerConfigurationRepository.active.value.isCustom) {
             val remaining = _state.value.profiles.filter { it.profileIndex != profileIndex }
             ProfilePinCacheStorage.removePayload(profileIndex)
             ServerRepository.removeProfile(profileIndex)
@@ -300,6 +399,9 @@ object ProfileRepository {
                 activeProfileIndex = _state.value.activeProfile!!.profileIndex
             }
             persist()
+            if (!AuthRepository.state.value.isAnonymous) {
+                saveCloudMetadataProfiles(remaining)
+            }
             return
         }
         try {
@@ -317,7 +419,7 @@ object ProfileRepository {
     }
 
     suspend fun verifyPin(profileIndex: Int, pin: String): PinVerifyResult {
-        if (AuthRepository.state.value !is AuthState.Authenticated) {
+        if (AuthRepository.state.value !is AuthState.Authenticated || !ServerConfigurationRepository.active.value.isCustom) {
             return verifyPinLocally(profileIndex, pin)
         }
 
@@ -343,6 +445,23 @@ object ProfileRepository {
         if (AuthRepository.state.value !is AuthState.Authenticated) {
             return PinVerifyResult(unlocked = false, message = getString(Res.string.profile_pin_set_requires_internet))
         }
+        if (!ServerConfigurationRepository.active.value.isCustom) {
+            if (!currentPin.isNullOrBlank()) {
+                val check = verifyPinLocally(profileIndex, currentPin)
+                if (!check.unlocked) return check
+            }
+            val updated = _state.value.profiles.map { p ->
+                if (p.profileIndex == profileIndex) p.copy(pinEnabled = true) else p
+            }
+            _state.value = _state.value.copy(
+                profiles = updated,
+                activeProfile = updated.find { it.profileIndex == activeProfileIndex } ?: updated.firstOrNull(),
+            )
+            rememberVerifiedPin(profileIndex = profileIndex, pin = pin)
+            persist()
+            saveCloudMetadataProfiles(updated)
+            return PinVerifyResult(unlocked = true)
+        }
 
         return runCatching {
             val params = buildJsonObject {
@@ -365,6 +484,23 @@ object ProfileRepository {
         if (AuthRepository.state.value !is AuthState.Authenticated) {
             return PinVerifyResult(unlocked = false, message = getString(Res.string.profile_pin_clear_requires_internet))
         }
+        if (!ServerConfigurationRepository.active.value.isCustom) {
+            if (!currentPin.isNullOrBlank()) {
+                val check = verifyPinLocally(profileIndex, currentPin)
+                if (!check.unlocked) return check
+            }
+            val updated = _state.value.profiles.map { p ->
+                if (p.profileIndex == profileIndex) p.copy(pinEnabled = false) else p
+            }
+            _state.value = _state.value.copy(
+                profiles = updated,
+                activeProfile = updated.find { it.profileIndex == activeProfileIndex } ?: updated.firstOrNull(),
+            )
+            ProfilePinCacheStorage.removePayload(profileIndex)
+            persist()
+            saveCloudMetadataProfiles(updated)
+            return PinVerifyResult(unlocked = true)
+        }
 
         return runCatching {
             val params = buildJsonObject {
@@ -383,6 +519,14 @@ object ProfileRepository {
     }
 
     suspend fun clearPinWithPassword(profileIndex: Int, accountPassword: String) {
+        if (!ServerConfigurationRepository.active.value.isCustom) {
+            val email = (AuthRepository.state.value as? AuthState.Authenticated)?.email ?: return
+            val check = CineAuthClient.login(email, accountPassword)
+            if (check.isSuccess) {
+                clearPin(profileIndex, currentPin = null)
+            }
+            return
+        }
         runCatching {
             val params = buildJsonObject {
                 put("p_account_password", accountPassword)
@@ -397,6 +541,15 @@ object ProfileRepository {
     }
 
     suspend fun pullProfileLocks(): List<ProfileLockState> {
+        if (!ServerConfigurationRepository.active.value.isCustom) {
+            return _state.value.profiles.map {
+                ProfileLockState(
+                    profileIndex = it.profileIndex,
+                    pinEnabled = it.pinEnabled,
+                    pinLockedUntil = it.pinLockedUntil,
+                )
+            }
+        }
         return runCatching {
             val result = SupabaseProvider.client.postgrest.rpc("sync_pull_profile_locks")
             result.decodeList<ProfileLockState>()
@@ -408,9 +561,12 @@ object ProfileRepository {
 
     private fun applyPayloadsLocally(payloads: List<ProfilePushPayload>) {
         val authState = AuthRepository.state.value as? AuthState.Authenticated ?: return
+        val existingByIndex = _state.value.profiles.associateBy { it.profileIndex }
         val profiles = payloads.map { p ->
+            val prev = existingByIndex[p.profileIndex]
             NuvioProfile(
-                id = "",
+                id = prev?.id?.ifBlank { "profile_${authState.userId.take(8)}_${p.profileIndex}" }
+                    ?: "profile_${authState.userId.take(8)}_${p.profileIndex}",
                 userId = authState.userId,
                 profileIndex = p.profileIndex,
                 name = p.name,
@@ -421,6 +577,8 @@ object ProfileRepository {
                 profileBackgroundUrl = p.profileBackgroundUrl,
                 usesPrimaryAddons = p.usesPrimaryAddons,
                 usesPrimaryPlugins = p.usesPrimaryPlugins,
+                pinEnabled = prev?.pinEnabled ?: false,
+                pinLockedUntil = prev?.pinLockedUntil,
             )
         }.sortedBy { it.profileIndex }
         _state.value = _state.value.copy(

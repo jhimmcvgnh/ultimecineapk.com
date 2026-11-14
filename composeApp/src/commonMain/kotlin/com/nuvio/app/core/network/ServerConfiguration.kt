@@ -50,8 +50,8 @@ object ServerConfigurationRepository {
 }
 
 internal fun officialConfiguration() = ServerConfiguration(
-    backendUrl = SupabaseConfig.URL.trim().trimEnd('/'),
-    publishableKey = SupabaseConfig.ANON_KEY.trim(),
+    backendUrl = SupabaseConfig.URL.trim().trimEnd('/').ifBlank { CineBackendConfig.SUPABASE_URL },
+    publishableKey = SupabaseConfig.ANON_KEY.trim().ifBlank { CineBackendConfig.SUPABASE_ANON_KEY },
     capabilities = ServerCapabilities(
         emailPasswordAuth = true,
         tvLogin = true,
