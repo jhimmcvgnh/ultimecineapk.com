@@ -16,7 +16,7 @@ internal actual fun createApiHttpClient(): HttpClient = HttpClient(OkHttp) {
         config {
             followRedirects(false)
             followSslRedirects(false)
-            retryOnConnectionFailure(false)
+            retryOnConnectionFailure(true)
         }
     }
 }

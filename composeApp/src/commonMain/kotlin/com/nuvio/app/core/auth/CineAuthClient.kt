@@ -4,6 +4,7 @@ import com.nuvio.app.core.network.CineBackendConfig
 import com.nuvio.app.core.network.createApiHttpClient
 import com.nuvio.app.core.network.readBoundedResponseBody
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
@@ -26,6 +27,7 @@ internal data class SessionStatusResult(
     val approved: Boolean,
     val email: String,
     val hasAccount: Boolean,
+    val endpointUnavailable: Boolean = false,
 )
 
 internal data class CineAuthUser(
@@ -92,6 +94,11 @@ internal object CineAuthClient {
         }.toString()
 
         val response = http.post("${CineBackendConfig.baseUrl}/api/auth/check-email") {
+            timeout {
+                connectTimeoutMillis = 5_000
+                socketTimeoutMillis = 8_000
+                requestTimeoutMillis = 8_000
+            }
             header("Content-Type", "application/json")
             header("Accept", "application/json")
             setBody(payload)
@@ -111,7 +118,20 @@ internal object CineAuthClient {
     suspend fun checkSessionStatus(sessionId: String): Result<SessionStatusResult> = runCatching {
         val encoded = sessionId.trim().encodeURLParameter()
         val response = http.get("${CineBackendConfig.baseUrl}/api/pix/session-status?sessionId=$encoded") {
+            timeout {
+                connectTimeoutMillis = 5_000
+                socketTimeoutMillis = 8_000
+                requestTimeoutMillis = 8_000
+            }
             header("Accept", "application/json")
+        }
+        if (response.status.value in setOf(404, 405, 501)) {
+            return@runCatching SessionStatusResult(
+                approved = false,
+                email = "",
+                hasAccount = false,
+                endpointUnavailable = true,
+            )
         }
         val rawBody = readBoundedResponseBody(response.bodyAsChannel(), response.contentLength())
         val parsed = json.decodeFromString<SessionStatusApiResponse>(rawBody)

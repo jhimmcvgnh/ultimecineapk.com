@@ -212,6 +212,12 @@ fun AuthScreen(
     var showLoginScreen by rememberSaveable { mutableStateOf(false) }
     var verifiedPaidEmail by rememberSaveable { mutableStateOf<String?>(null) }
     var activeCheckoutSessionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmedPaidEmail by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmedPaidHasAccount by rememberSaveable { mutableStateOf(false) }
+    var confirmedPaymentId by rememberSaveable { mutableStateOf<String?>(null) }
+    var manualCheckEmail by rememberSaveable { mutableStateOf("") }
+    var showManualEmailFallback by rememberSaveable { mutableStateOf(false) }
+    var isConfirmingPayment by rememberSaveable { mutableStateOf(false) }
     var localError by rememberSaveable { mutableStateOf<String?>(null) }
 
     var isSignUp by rememberSaveable { mutableStateOf(true) }
@@ -226,6 +232,20 @@ fun AuthScreen(
 
     val effectiveError = localError ?: authError
 
+    fun unlockWithConfirmedPayment(approvedEmail: String, hasExistingAccount: Boolean) {
+        email = approvedEmail
+        verifiedPaidEmail = approvedEmail
+        isSignUp = !hasExistingAccount
+        activeCheckoutSessionId = null
+        confirmedPaidEmail = null
+        confirmedPaymentId = null
+        showManualEmailFallback = false
+        isConfirmingPayment = false
+        localError = null
+        AuthRepository.clearError()
+        showLoginScreen = true
+    }
+
     LaunchedEffect(pendingDeepLink) {
         val deepLink = pendingDeepLink
         if (deepLink is AppDeepLink.PaymentApproved) {
@@ -236,19 +256,23 @@ fun AuthScreen(
                     activeCheckoutSessionId = null
                     return@LaunchedEffect
                 }
-                isLoading = true
+                isConfirmingPayment = true
                 localError = null
                 AuthRepository.clearError()
                 val check = CineAuthClient.checkEmail(paidEmail, deepLink.paymentId)
-                isLoading = false
+                isConfirmingPayment = false
                 if (check.isSuccess) {
                     val info = check.getOrThrow()
                     if (info.entitlementActive) {
-                        email = info.email
-                        verifiedPaidEmail = info.email
-                        isSignUp = !info.hasAccount
-                        activeCheckoutSessionId = null
-                        showLoginScreen = true
+                        confirmedPaidEmail = info.email
+                        confirmedPaidHasAccount = info.hasAccount
+                        confirmedPaymentId = deepLink.paymentId
+                        if (activeCheckoutSessionId == null) {
+                            activeCheckoutSessionId = "chk_deeplink"
+                        }
+                        if (manualCheckEmail.isBlank()) {
+                            manualCheckEmail = info.email
+                        }
                     } else {
                         localError = "Acesso negado: O Gmail $paidEmail ainda não possui pagamento PIX de R$ 10,00 aprovado."
                         showLoginScreen = false
@@ -261,26 +285,36 @@ fun AuthScreen(
         }
     }
 
-    LaunchedEffect(activeCheckoutSessionId, showLoginScreen, appVisibility) {
+    LaunchedEffect(activeCheckoutSessionId, showLoginScreen, confirmedPaidEmail, appVisibility) {
         val sessionId = activeCheckoutSessionId ?: return@LaunchedEffect
-        if (showLoginScreen) return@LaunchedEffect
+        if (showLoginScreen || confirmedPaidEmail != null || sessionId == "chk_deeplink") return@LaunchedEffect
 
         repeat(600) { attempt ->
             if (attempt > 0) {
-                delay(if (appVisibility == AppVisibility.Foreground) 1_000L else 4_000L)
+                delay(if (appVisibility == AppVisibility.Foreground) 1_000L else 3_000L)
             }
             val statusResult = CineAuthClient.checkSessionStatus(sessionId)
-            val status = statusResult.getOrNull()
-            if (status != null && status.approved && status.email.isNotBlank()) {
-                email = status.email
-                verifiedPaidEmail = status.email
-                isSignUp = !status.hasAccount
-                activeCheckoutSessionId = null
-                localError = null
-                AuthRepository.clearError()
-                showLoginScreen = true
+            val status = statusResult.getOrNull() ?: return@repeat
+            if (status.endpointUnavailable) {
+                showManualEmailFallback = true
                 return@LaunchedEffect
             }
+            if (status.approved && status.email.isNotBlank()) {
+                confirmedPaidEmail = status.email
+                confirmedPaidHasAccount = status.hasAccount
+                localError = null
+                AuthRepository.clearError()
+                return@LaunchedEffect
+            }
+        }
+    }
+
+    LaunchedEffect(activeCheckoutSessionId, showLoginScreen, confirmedPaidEmail) {
+        val sessionId = activeCheckoutSessionId ?: return@LaunchedEffect
+        if (showLoginScreen || confirmedPaidEmail != null || showManualEmailFallback) return@LaunchedEffect
+        delay(12_000L)
+        if (activeCheckoutSessionId == sessionId && confirmedPaidEmail == null && !showLoginScreen) {
+            showManualEmailFallback = true
         }
     }
 
@@ -289,13 +323,64 @@ fun AuthScreen(
         AuthRepository.clearError()
         val sessionId = "chk_${Uuid.random()}"
         activeCheckoutSessionId = sessionId
+        confirmedPaidEmail = null
+        confirmedPaidHasAccount = false
+        confirmedPaymentId = null
+        showManualEmailFallback = false
+        isConfirmingPayment = false
         uriHandler.openUri("${CineBackendConfig.checkoutUrl}?session=$sessionId")
+    }
+
+    fun proceedIfPaymentConfirmed() {
+        if (isConfirmingPayment || activeCheckoutSessionId == null) return
+        localError = null
+        AuthRepository.clearError()
+
+        val alreadyConfirmedEmail = confirmedPaidEmail
+        if (!alreadyConfirmedEmail.isNullOrBlank()) {
+            unlockWithConfirmedPayment(alreadyConfirmedEmail, confirmedPaidHasAccount)
+            return
+        }
+
+        val sessionId = activeCheckoutSessionId
+        val typedEmail = manualCheckEmail.trim().lowercase()
+        isConfirmingPayment = true
+        scope.launch {
+            val sessionStatus = sessionId
+                ?.takeIf { it != "chk_deeplink" }
+                ?.let { CineAuthClient.checkSessionStatus(it).getOrNull() }
+            if (sessionStatus != null && sessionStatus.approved && sessionStatus.email.isNotBlank()) {
+                unlockWithConfirmedPayment(sessionStatus.email, sessionStatus.hasAccount)
+                return@launch
+            }
+
+            if (typedEmail.contains("@") && typedEmail.contains(".")) {
+                val check = CineAuthClient.checkEmail(typedEmail, confirmedPaymentId)
+                isConfirmingPayment = false
+                if (check.isSuccess) {
+                    val info = check.getOrThrow()
+                    if (info.entitlementActive) {
+                        unlockWithConfirmedPayment(info.email, info.hasAccount)
+                    } else {
+                        localError = "Pagamento PIX de R$ 10,00 ainda não confirmado para ${info.email}. Conclua o PIX no site ou aguarde alguns segundos e tente novamente."
+                    }
+                } else {
+                    localError = check.exceptionOrNull()?.message
+                        ?: "Não foi possível confirmar o pagamento agora. Tente novamente em instantes."
+                }
+            } else {
+                isConfirmingPayment = false
+                localError = "Confirmação automática pendente. Digite o mesmo Gmail usado no PIX do site para confirmar e prosseguir."
+            }
+        }
     }
 
     fun openExistingAccountLogin() {
         localError = null
         AuthRepository.clearError()
         verifiedPaidEmail = null
+        confirmedPaidEmail = null
+        isConfirmingPayment = false
         isSignUp = false
         showLoginScreen = true
     }
@@ -304,6 +389,8 @@ fun AuthScreen(
         localError = null
         AuthRepository.clearError()
         verifiedPaidEmail = null
+        confirmedPaidEmail = null
+        isConfirmingPayment = false
         showLoginScreen = false
     }
 
@@ -390,6 +477,10 @@ fun AuthScreen(
                         showLoginScreen = showLoginScreen,
                         verifiedPaidEmail = verifiedPaidEmail,
                         isWaitingPayment = activeCheckoutSessionId != null && !showLoginScreen,
+                        confirmedPaidEmail = confirmedPaidEmail,
+                        manualCheckEmail = manualCheckEmail,
+                        showManualEmailFallback = showManualEmailFallback,
+                        isConfirmingPayment = isConfirmingPayment,
                         isSignUp = isSignUp,
                         email = email,
                         password = password,
@@ -419,6 +510,12 @@ fun AuthScreen(
                         onSubmit = ::submitAuth,
                         onToggleAuthMode = ::toggleAuthMode,
                         onStartCheckout = ::startCheckout,
+                        onManualCheckEmailChange = {
+                            manualCheckEmail = it
+                            localError = null
+                            AuthRepository.clearError()
+                        },
+                        onProceedPaid = ::proceedIfPaymentConfirmed,
                         onOpenExistingAccountLogin = ::openExistingAccountLogin,
                         onReturnToPaywall = ::returnToPaywall,
                         onStartDeviceLink = ::startDeviceLink,
@@ -431,6 +528,10 @@ fun AuthScreen(
                         showLoginScreen = showLoginScreen,
                         verifiedPaidEmail = verifiedPaidEmail,
                         isWaitingPayment = activeCheckoutSessionId != null && !showLoginScreen,
+                        confirmedPaidEmail = confirmedPaidEmail,
+                        manualCheckEmail = manualCheckEmail,
+                        showManualEmailFallback = showManualEmailFallback,
+                        isConfirmingPayment = isConfirmingPayment,
                         isSignUp = isSignUp,
                         email = email,
                         password = password,
@@ -456,6 +557,12 @@ fun AuthScreen(
                         onSubmit = ::submitAuth,
                         onToggleAuthMode = ::toggleAuthMode,
                         onStartCheckout = ::startCheckout,
+                        onManualCheckEmailChange = {
+                            manualCheckEmail = it
+                            localError = null
+                            AuthRepository.clearError()
+                        },
+                        onProceedPaid = ::proceedIfPaymentConfirmed,
                         onOpenExistingAccountLogin = ::openExistingAccountLogin,
                         onReturnToPaywall = ::returnToPaywall,
                         onStartDeviceLink = ::startDeviceLink,
@@ -533,6 +640,10 @@ private fun AuthMobileLayout(
     showLoginScreen: Boolean,
     verifiedPaidEmail: String?,
     isWaitingPayment: Boolean,
+    confirmedPaidEmail: String?,
+    manualCheckEmail: String,
+    showManualEmailFallback: Boolean,
+    isConfirmingPayment: Boolean,
     isSignUp: Boolean,
     email: String,
     password: String,
@@ -548,6 +659,8 @@ private fun AuthMobileLayout(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onStartCheckout: () -> Unit,
+    onManualCheckEmailChange: (String) -> Unit,
+    onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
     onReturnToPaywall: () -> Unit,
     onStartDeviceLink: () -> Unit,
@@ -601,6 +714,10 @@ private fun AuthMobileLayout(
                 showLoginScreen = showLoginScreen,
                 verifiedPaidEmail = verifiedPaidEmail,
                 isWaitingPayment = isWaitingPayment,
+                confirmedPaidEmail = confirmedPaidEmail,
+                manualCheckEmail = manualCheckEmail,
+                showManualEmailFallback = showManualEmailFallback,
+                isConfirmingPayment = isConfirmingPayment,
                 isSignUp = isSignUp,
                 email = email,
                 password = password,
@@ -616,6 +733,8 @@ private fun AuthMobileLayout(
                 onSubmit = onSubmit,
                 onToggleAuthMode = onToggleAuthMode,
                 onStartCheckout = onStartCheckout,
+                onManualCheckEmailChange = onManualCheckEmailChange,
+                onProceedPaid = onProceedPaid,
                 onOpenExistingAccountLogin = onOpenExistingAccountLogin,
                 onReturnToPaywall = onReturnToPaywall,
                 onStartDeviceLink = onStartDeviceLink,
@@ -633,6 +752,10 @@ private fun AuthLargeLayout(
     showLoginScreen: Boolean,
     verifiedPaidEmail: String?,
     isWaitingPayment: Boolean,
+    confirmedPaidEmail: String?,
+    manualCheckEmail: String,
+    showManualEmailFallback: Boolean,
+    isConfirmingPayment: Boolean,
     isSignUp: Boolean,
     email: String,
     password: String,
@@ -652,6 +775,8 @@ private fun AuthLargeLayout(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onStartCheckout: () -> Unit,
+    onManualCheckEmailChange: (String) -> Unit,
+    onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
     onReturnToPaywall: () -> Unit,
     onStartDeviceLink: () -> Unit,
@@ -716,7 +841,8 @@ private fun AuthLargeLayout(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = formHorizontalPadding),
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = formHorizontalPadding, vertical = 24.dp * scale),
             ) {
                 AuthHeading(
                     showLoginScreen = showLoginScreen,
@@ -742,6 +868,10 @@ private fun AuthLargeLayout(
                     showLoginScreen = showLoginScreen,
                     verifiedPaidEmail = verifiedPaidEmail,
                     isWaitingPayment = isWaitingPayment,
+                    confirmedPaidEmail = confirmedPaidEmail,
+                    manualCheckEmail = manualCheckEmail,
+                    showManualEmailFallback = showManualEmailFallback,
+                    isConfirmingPayment = isConfirmingPayment,
                     isSignUp = isSignUp,
                     email = email,
                     password = password,
@@ -758,6 +888,8 @@ private fun AuthLargeLayout(
                     onSubmit = onSubmit,
                     onToggleAuthMode = onToggleAuthMode,
                     onStartCheckout = onStartCheckout,
+                    onManualCheckEmailChange = onManualCheckEmailChange,
+                    onProceedPaid = onProceedPaid,
                     onOpenExistingAccountLogin = onOpenExistingAccountLogin,
                     onReturnToPaywall = onReturnToPaywall,
                     onStartDeviceLink = onStartDeviceLink,
@@ -846,6 +978,10 @@ private fun AuthForm(
     showLoginScreen: Boolean,
     verifiedPaidEmail: String?,
     isWaitingPayment: Boolean,
+    confirmedPaidEmail: String?,
+    manualCheckEmail: String,
+    showManualEmailFallback: Boolean,
+    isConfirmingPayment: Boolean,
     isSignUp: Boolean,
     email: String,
     password: String,
@@ -862,6 +998,8 @@ private fun AuthForm(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onStartCheckout: () -> Unit,
+    onManualCheckEmailChange: (String) -> Unit,
+    onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
     onReturnToPaywall: () -> Unit,
     onStartDeviceLink: () -> Unit,
@@ -874,11 +1012,18 @@ private fun AuthForm(
     ) {
         if (!showLoginScreen) {
             AppPaywallPreCheckoutSection(
+                metrics = metrics,
                 scale = scale,
                 primaryHeight = metrics.primaryHeight,
                 isWaitingPayment = isWaitingPayment,
+                confirmedPaidEmail = confirmedPaidEmail,
+                manualCheckEmail = manualCheckEmail,
+                showManualEmailFallback = showManualEmailFallback,
+                isConfirmingPayment = isConfirmingPayment,
                 authError = authError,
                 onGoToCheckout = onStartCheckout,
+                onManualCheckEmailChange = onManualCheckEmailChange,
+                onProceedPaid = onProceedPaid,
                 onOpenExistingAccountLogin = onOpenExistingAccountLogin,
             )
         } else {
@@ -1341,11 +1486,18 @@ private fun LayoutCoordinates.boundsInRoot(): Rect {
 
 @Composable
 private fun AppPaywallPreCheckoutSection(
+    metrics: AuthFormMetrics,
     scale: Float,
     primaryHeight: Dp,
     isWaitingPayment: Boolean,
+    confirmedPaidEmail: String?,
+    manualCheckEmail: String,
+    showManualEmailFallback: Boolean,
+    isConfirmingPayment: Boolean,
     authError: String?,
     onGoToCheckout: () -> Unit,
+    onManualCheckEmailChange: (String) -> Unit,
+    onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
 ) {
     Column(
@@ -1434,31 +1586,74 @@ private fun AppPaywallPreCheckoutSection(
 
                 if (isWaitingPayment) {
                     Spacer(modifier = Modifier.height(14.dp * scale))
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        color = Color(0xFF22C55E).copy(alpha = 0.10f),
-                        border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp * scale, vertical = 10.dp * scale),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp * scale),
+                    if (confirmedPaidEmail != null) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color(0xFF22C55E).copy(alpha = 0.16f),
+                            border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.55f)),
                         ) {
-                            NuvioLoadingIndicator(
-                                size = 20.dp * scale,
-                                color = Color(0xFF4ADE80),
-                            )
                             Text(
-                                text = "⏳ Aguardando confirmação automática do PIX... Após pagar no site, esta tela abrirá sozinha para criar sua senha.",
+                                text = "✓ Pagamento PIX de R$ 10,00 confirmado para $confirmedPaidEmail! Toque abaixo para prosseguir.",
                                 style = MaterialTheme.typography.bodySmall.copy(
-                                    color = Color(0xFFBBF7D0),
-                                    fontSize = (12.5f * scale).sp,
+                                    color = Color(0xFF4ADE80),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = (13f * scale).sp,
                                     lineHeight = (18f * scale).sp,
                                 ),
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier.padding(horizontal = 12.dp * scale, vertical = 12.dp * scale),
+                            )
+                        }
+                    } else {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color(0xFF22C55E).copy(alpha = 0.10f),
+                            border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp * scale, vertical = 10.dp * scale),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp * scale),
+                            ) {
+                                NuvioLoadingIndicator(
+                                    size = 20.dp * scale,
+                                    color = Color(0xFF4ADE80),
+                                )
+                                Text(
+                                    text = if (showManualEmailFallback) {
+                                        "⏳ Confirmação automática aguardando resposta. Se já pagou o PIX no site, informe o mesmo Gmail abaixo para verificar e prosseguir:"
+                                    } else {
+                                        "⏳ Confirmando seu PIX automaticamente... Assim que o pagamento for aprovado, o botão para prosseguir aparecerá aqui."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFBBF7D0),
+                                        fontSize = (12.5f * scale).sp,
+                                        lineHeight = (18f * scale).sp,
+                                    ),
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+
+                        if (showManualEmailFallback) {
+                            Spacer(modifier = Modifier.height(12.dp * scale))
+                            AuthTextField(
+                                value = manualCheckEmail,
+                                onValueChange = onManualCheckEmailChange,
+                                placeholder = "Gmail usado no PIX do site",
+                                icon = Icons.Rounded.Email,
+                                metrics = metrics,
+                                scale = scale,
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Email,
+                                    imeAction = ImeAction.Done,
+                                ),
+                                keyboardActions = KeyboardActions(
+                                    onDone = { onProceedPaid() },
+                                ),
                             )
                         }
                     }
@@ -1478,24 +1673,66 @@ private fun AppPaywallPreCheckoutSection(
 
                 Spacer(modifier = Modifier.height(18.dp * scale))
 
-                Button(
-                    onClick = onGoToCheckout,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(primaryHeight),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF22C55E),
-                        contentColor = Color.White,
-                    ),
-                ) {
-                    Text(
-                        text = if (isWaitingPayment) "🌐 Reabrir Site de Pagamento PIX" else "⚡ Pagar R$ 10,00 no Site e Liberar",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontSize = (15f * scale).sp,
+                if (isWaitingPayment && (confirmedPaidEmail != null || showManualEmailFallback)) {
+                    Button(
+                        onClick = onProceedPaid,
+                        enabled = !isConfirmingPayment,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(primaryHeight),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF22C55E),
+                            contentColor = Color.White,
+                            disabledContainerColor = Color(0xFF22C55E).copy(alpha = 0.55f),
+                            disabledContentColor = Color.White.copy(alpha = 0.8f),
                         ),
+                    ) {
+                        if (isConfirmingPayment) {
+                            NuvioLoadingIndicator(
+                                size = 20.dp * scale,
+                                color = Color.White,
+                            )
+                        } else {
+                            Text(
+                                text = "✓ Já fiz o pagamento • Prosseguir →",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = (15f * scale).sp,
+                                ),
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp * scale))
+
+                    AuthSecondaryButton(
+                        text = "🌐 Reabrir Site de Pagamento PIX",
+                        enabled = !isConfirmingPayment,
+                        height = primaryHeight,
+                        scale = scale,
+                        onClick = onGoToCheckout,
                     )
+                } else {
+                    Button(
+                        onClick = onGoToCheckout,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(primaryHeight),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF22C55E),
+                            contentColor = Color.White,
+                        ),
+                    ) {
+                        Text(
+                            text = if (isWaitingPayment) "🌐 Reabrir Site de Pagamento PIX" else "⚡ Pagar R$ 10,00 no Site e Liberar",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontSize = (15f * scale).sp,
+                            ),
+                        )
+                    }
                 }
             }
         }
