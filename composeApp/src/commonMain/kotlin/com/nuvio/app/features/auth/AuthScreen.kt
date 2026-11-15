@@ -1,6 +1,9 @@
 package com.nuvio.app.features.auth
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
@@ -23,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -66,6 +70,7 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -81,6 +86,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -127,21 +133,22 @@ import nuvio.composeapp.generated.resources.compose_auth_terms_prefix
 import nuvio.composeapp.generated.resources.compose_auth_welcome_back
 import org.jetbrains.compose.resources.stringResource
 
-internal val AuthTextPrimary = Color(0xFFF5F7F8)
-internal val AuthTextSecondary = Color(0xFF969CA3)
-private val AuthTextMuted = Color(0xFF6E7178)
-private val AuthPrimaryButtonBackground = Color(0xFFF5F5F5)
-private val AuthPrimaryButtonText = Color(0xFF111111)
-internal val AuthFieldBackground = Color.White.copy(alpha = 0.04f)
-private val AuthFieldBackgroundMobile = Color.White.copy(alpha = 0.035f)
-internal val AuthFieldBorder = Color.White.copy(alpha = 0.08f)
-private val AuthPaneBackground = Color.White.copy(alpha = 0.022f)
-private val AuthPaneBorder = Color.White.copy(alpha = 0.07f)
-private val AuthDividerColor = Color.White.copy(alpha = 0.10f)
-private val AuthSecondaryButtonBackground = Color.White.copy(alpha = 0.05f)
-private val AuthSecondaryButtonBorder = Color.White.copy(alpha = 0.09f)
+internal val AuthTextPrimary = Color(0xFFF3F6FC)
+internal val AuthTextSecondary = Color(0xFF93A1B8)
+private val AuthTextMuted = Color(0xFF69768E)
+private val AuthAccentBlue = Color(0xFF2563EB)
+private val AuthAccentBlueBright = Color(0xFF3B82F6)
+private val AuthAccentBlueSoft = Color(0xFF60A5FA)
+private val AuthPrimaryButtonBackground = Color(0xFF2563EB)
+private val AuthPrimaryButtonText = Color(0xFFF8FAFC)
+internal val AuthFieldBackground = Color(0xFF0D1119)
+private val AuthFieldBackgroundMobile = Color(0xFF0D1119)
+internal val AuthFieldBorder = Color(0xFF1F2B42)
+private val AuthDividerColor = Color(0xFF1E293B)
+private val AuthSecondaryButtonBackground = Color(0xFF101520)
+private val AuthSecondaryButtonBorder = Color(0xFF253552)
 
-private data class AuthFormMetrics(
+internal data class AuthFormMetrics(
     val fieldHeight: Dp,
     val fieldHorizontalPadding: Dp,
     val iconSize: Dp,
@@ -169,7 +176,7 @@ private val MobileAuthFormMetrics = AuthFormMetrics(
     fieldBackground = AuthFieldBackgroundMobile,
 )
 
-private val LargeAuthFormMetrics = AuthFormMetrics(
+internal val LargeAuthFormMetrics = AuthFormMetrics(
     fieldHeight = 58.dp,
     fieldHorizontalPadding = 18.dp,
     iconSize = 20.dp,
@@ -585,18 +592,18 @@ fun AuthScreen(
         ) {
             val screenWidth = maxWidth
             val largeScreen = screenWidth >= 900.dp
-            val compactLargeScreen = screenWidth < 1100.dp
 
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .authGradientBackground(largeScreen = largeScreen),
             ) {
+                PaperGrainOverlay(
+                    alpha = 0.032f,
+                    modifier = Modifier.fillMaxSize(),
+                )
                 if (largeScreen) {
                     val largeScale = largeAuthScale(screenWidth)
-                    val formPaneWidth = (screenWidth * 0.30f).coerceIn(460.dp * largeScale, 720.dp * largeScale)
-                    val brandHorizontalPadding = (screenWidth * 0.055f).coerceIn(56.dp * largeScale, 128.dp * largeScale)
-                    val formHorizontalPadding = (formPaneWidth * 0.14f).coerceIn(48.dp, 96.dp)
                     val formMetrics = largeAuthFormMetrics(largeScale)
 
                     AuthLargeLayout(
@@ -617,9 +624,7 @@ fun AuthScreen(
                         authError = effectiveError,
                         deviceLinkAuthState = deviceLinkAuthState,
                         deviceLinkEnabled = serverConnectionState.activeServer.capabilities.tvLogin,
-                        formPaneWidth = if (compactLargeScreen) 460.dp else formPaneWidth,
-                        brandHorizontalPadding = brandHorizontalPadding,
-                        formHorizontalPadding = formHorizontalPadding,
+                        statusBarTop = statusBarTop,
                         formMetrics = formMetrics,
                         scale = largeScale,
                         onEmailChange = {
@@ -715,8 +720,8 @@ fun AuthScreen(
                     showServerSheet = true
                 },
                 modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(start = 8.dp, top = statusBarTop + 4.dp),
+                    .align(Alignment.TopEnd)
+                    .padding(end = 10.dp, top = statusBarTop + 6.dp),
             )
         }
     }
@@ -798,47 +803,100 @@ private fun AuthMobileLayout(
     onEmailBoundsChange: (Rect) -> Unit,
     onPasswordBoundsChange: (Rect) -> Unit,
 ) {
+    val entrance = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        entrance.animateTo(1f, animationSpec = tween(durationMillis = 650, easing = FastOutSlowInEasing))
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(
-                start = 30.dp,
-                top = statusBarTop + 48.dp,
-                end = 30.dp,
-                bottom = 40.dp,
+                start = 16.dp,
+                top = statusBarTop + 14.dp,
+                end = 16.dp,
+                bottom = 32.dp,
             ),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        SmokePaperCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(210.dp),
+            cornerRadius = 26,
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 20.dp, vertical = 18.dp),
+            ) {
+                AppBrandWordmark(
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .height(28.dp),
+                )
+
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .widthIn(max = 310.dp),
+                ) {
+                    Text(
+                        text = stringResource(Res.string.compose_auth_tagline),
+                        style = MaterialTheme.typography.headlineSmall.copy(
+                            color = AuthTextPrimary,
+                            fontSize = 21.sp,
+                            lineHeight = 24.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(Res.string.compose_auth_sign_up_subtitle),
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFF9FB0CC),
+                            fontSize = 12.5.sp,
+                            lineHeight = 17.sp,
+                        ),
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(18.dp))
+
         Column(
             modifier = Modifier
-                .widthIn(max = 342.dp)
-                .fillMaxWidth(),
+                .widthIn(max = 384.dp)
+                .fillMaxWidth()
+                .graphicsLayer {
+                    val p = entrance.value
+                    alpha = p
+                    translationY = (1f - p) * 16.dp.toPx()
+                },
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            AuthBrandLockup(logoHeight = 38.dp)
-
-            Spacer(modifier = Modifier.height(48.dp))
-
             AuthHeading(
                 showLoginScreen = showLoginScreen,
                 verifiedPaidEmail = verifiedPaidEmail,
                 isSignUp = isSignUp,
                 headingStyle = MaterialTheme.typography.headlineLarge.copy(
                     color = AuthTextPrimary,
-                    fontSize = 28.sp,
-                    lineHeight = 31.sp,
+                    fontSize = 26.sp,
+                    lineHeight = 30.sp,
                     fontWeight = FontWeight.SemiBold,
                 ),
                 subtitleStyle = MaterialTheme.typography.bodyLarge.copy(
                     color = AuthTextSecondary,
-                    fontSize = 15.sp,
-                    lineHeight = 21.sp,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
                     fontWeight = FontWeight.Normal,
                 ),
             )
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
             AuthForm(
                 showLoginScreen = showLoginScreen,
@@ -896,9 +954,7 @@ private fun AuthLargeLayout(
     authError: String?,
     deviceLinkAuthState: DeviceLinkAuthState,
     deviceLinkEnabled: Boolean,
-    formPaneWidth: Dp,
-    brandHorizontalPadding: Dp,
-    formHorizontalPadding: Dp,
+    statusBarTop: Dp,
     formMetrics: AuthFormMetrics,
     scale: Float,
     onEmailChange: (String) -> Unit,
@@ -916,146 +972,179 @@ private fun AuthLargeLayout(
     onEmailBoundsChange: (Rect) -> Unit,
     onPasswordBoundsChange: (Rect) -> Unit,
 ) {
+    val entrance = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        entrance.animateTo(1f, animationSpec = tween(durationMillis = 700, easing = FastOutSlowInEasing))
+    }
+
+    val safeTop = if (statusBarTop > 8.dp) statusBarTop + 8.dp else 14.dp
+
     Row(
-        modifier = modifier,
+        modifier = modifier.padding(
+            start = 16.dp,
+            top = safeTop,
+            end = 16.dp,
+            bottom = 14.dp,
+        ),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Column(
+        // Left: stacked dark paper stack with live black-and-blue billowing smoke
+        SmokePaperCard(
             modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-                .padding(horizontal = brandHorizontalPadding),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.Start,
+                .weight(1.06f)
+                .fillMaxHeight(),
+            cornerRadius = 28,
         ) {
-            AppBrandWordmark(
-                contentDescription = null,
-                modifier = Modifier.height(60.dp * scale),
-            )
-            Spacer(modifier = Modifier.height(32.dp * scale))
-            Text(
-                text = stringResource(Res.string.compose_auth_tagline),
-                modifier = Modifier.widthIn(max = 440.dp * scale),
-                style = MaterialTheme.typography.displayLarge.copy(
-                    color = AuthTextPrimary,
-                    fontSize = (40f * scale).sp,
-                    lineHeight = (45f * scale).sp,
-                    fontWeight = FontWeight.SemiBold,
-                ),
-            )
-            Spacer(modifier = Modifier.height(18.dp * scale))
-            Text(
-                text = stringResource(Res.string.compose_auth_sign_up_subtitle),
-                modifier = Modifier.widthIn(max = 400.dp * scale),
-                style = MaterialTheme.typography.bodyLarge.copy(
-                    color = AuthTextSecondary,
-                    fontSize = (17f * scale).sp,
-                    lineHeight = (26f * scale).sp,
-                    fontWeight = FontWeight.Normal,
-                ),
-            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 28.dp * scale, vertical = 26.dp * scale),
+            ) {
+                AppBrandWordmark(
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .height(34.dp * scale)
+                        .graphicsLayer { alpha = entrance.value },
+                )
+
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .widthIn(max = 390.dp * scale)
+                        .graphicsLayer {
+                            val p = entrance.value
+                            alpha = p
+                            translationY = (1f - p) * 14.dp.toPx()
+                        },
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = AuthAccentBlue.copy(alpha = 0.16f),
+                        border = BorderStroke(1.dp, AuthAccentBlueBright.copy(alpha = 0.34f)),
+                    ) {
+                        Text(
+                            text = "CINE ULTIMATE • 4K ULTRA HD",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = AuthAccentBlueSoft,
+                                fontWeight = FontWeight.SemiBold,
+                                letterSpacing = 0.8.sp,
+                                fontSize = (10.5f * scale).sp,
+                            ),
+                            modifier = Modifier.padding(horizontal = 10.dp * scale, vertical = 4.dp * scale),
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(12.dp * scale))
+                    Text(
+                        text = stringResource(Res.string.compose_auth_tagline),
+                        style = MaterialTheme.typography.displaySmall.copy(
+                            color = AuthTextPrimary,
+                            fontSize = (31f * scale).sp,
+                            lineHeight = (35f * scale).sp,
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                    )
+                    Spacer(modifier = Modifier.height(8.dp * scale))
+                    Text(
+                        text = stringResource(Res.string.compose_auth_sign_up_subtitle),
+                        style = MaterialTheme.typography.bodyLarge.copy(
+                            color = Color(0xFF9EB0CC),
+                            fontSize = (14.5f * scale).sp,
+                            lineHeight = (21f * scale).sp,
+                            fontWeight = FontWeight.Normal,
+                        ),
+                    )
+                }
+            }
         }
 
-        Box(
+        // Right: Cine Ultimate payment & profile access flow on obsidian paper
+        BoxWithConstraints(
             modifier = Modifier
-                .width(formPaneWidth)
-                .fillMaxHeight()
-                .background(AuthPaneBackground)
-                .drawBehind {
-                    drawLine(
-                        color = AuthPaneBorder,
-                        start = Offset(0f, 0f),
-                        end = Offset(0f, size.height),
-                        strokeWidth = 1.dp.toPx(),
-                    )
-                },
-            contentAlignment = Alignment.Center,
+                .weight(0.94f)
+                .fillMaxHeight(),
         ) {
+            val availableHeight = maxHeight
+            val compactVertical = availableHeight < 760.dp
+            val rightHorizontalPadding = if (maxWidth < 460.dp) 18.dp else 32.dp * scale
+            val rightVerticalPadding = if (compactVertical) 10.dp else 24.dp * scale
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = formHorizontalPadding, vertical = 24.dp * scale),
+                    .heightIn(min = availableHeight)
+                    .padding(horizontal = rightHorizontalPadding, vertical = rightVerticalPadding)
+                    .graphicsLayer {
+                        val p = entrance.value
+                        alpha = p
+                        translationY = (1f - p) * 14.dp.toPx()
+                    },
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                AuthHeading(
-                    showLoginScreen = showLoginScreen,
-                    verifiedPaidEmail = verifiedPaidEmail,
-                    isSignUp = isSignUp,
-                    headingStyle = MaterialTheme.typography.headlineLarge.copy(
-                        color = AuthTextPrimary,
-                        fontSize = (30f * scale).sp,
-                        lineHeight = (33f * scale).sp,
-                        fontWeight = FontWeight.SemiBold,
-                    ),
-                    subtitleStyle = MaterialTheme.typography.bodyLarge.copy(
-                        color = AuthTextSecondary,
-                        fontSize = (15f * scale).sp,
-                        lineHeight = (21f * scale).sp,
-                        fontWeight = FontWeight.Normal,
-                    ),
-                )
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 420.dp * scale)
+                        .fillMaxWidth(),
+                ) {
+                    AuthHeading(
+                        showLoginScreen = showLoginScreen,
+                        verifiedPaidEmail = verifiedPaidEmail,
+                        isSignUp = isSignUp,
+                        headingStyle = MaterialTheme.typography.headlineLarge.copy(
+                            color = AuthTextPrimary,
+                            fontSize = if (compactVertical) 25.sp else (29f * scale).sp,
+                            lineHeight = if (compactVertical) 29.sp else (33f * scale).sp,
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        subtitleStyle = MaterialTheme.typography.bodyLarge.copy(
+                            color = AuthTextSecondary,
+                            fontSize = if (compactVertical) 13.5.sp else (14.5f * scale).sp,
+                            lineHeight = if (compactVertical) 19.sp else (20.5f * scale).sp,
+                            fontWeight = FontWeight.Normal,
+                        ),
+                    )
 
-                Spacer(modifier = Modifier.height(28.dp * scale))
+                    Spacer(modifier = Modifier.height(if (compactVertical) 12.dp else 20.dp * scale))
 
-                AuthForm(
-                    showLoginScreen = showLoginScreen,
-                    priceLabel = priceLabel,
-                    verifiedPaidEmail = verifiedPaidEmail,
-                    isWaitingPayment = isWaitingPayment,
-                    confirmedPaidEmail = confirmedPaidEmail,
-                    manualCheckEmail = manualCheckEmail,
-                    showManualEmailFallback = showManualEmailFallback,
-                    isConfirmingPayment = isConfirmingPayment,
-                    isSignUp = isSignUp,
-                    email = email,
-                    password = password,
-                    passwordVisible = passwordVisible,
-                    isLoading = isLoading,
-                    authError = authError,
-                    deviceLinkAuthState = deviceLinkAuthState,
-                    deviceLinkEnabled = deviceLinkEnabled,
-                    metrics = formMetrics,
-                    scale = scale,
-                    onEmailChange = onEmailChange,
-                    onPasswordChange = onPasswordChange,
-                    onPasswordVisibilityToggle = onPasswordVisibilityToggle,
-                    onSubmit = onSubmit,
-                    onToggleAuthMode = onToggleAuthMode,
-                    onStartCheckout = onStartCheckout,
-                    onManualCheckEmailChange = onManualCheckEmailChange,
-                    onProceedPaid = onProceedPaid,
-                    onOpenExistingAccountLogin = onOpenExistingAccountLogin,
-                    onReturnToPaywall = onReturnToPaywall,
-                    onStartDeviceLink = onStartDeviceLink,
-                    onCancelDeviceLink = onCancelDeviceLink,
-                    onEmailBoundsChange = onEmailBoundsChange,
-                    onPasswordBoundsChange = onPasswordBoundsChange,
-                )
+                    AuthForm(
+                        showLoginScreen = showLoginScreen,
+                        priceLabel = priceLabel,
+                        verifiedPaidEmail = verifiedPaidEmail,
+                        isWaitingPayment = isWaitingPayment,
+                        confirmedPaidEmail = confirmedPaidEmail,
+                        manualCheckEmail = manualCheckEmail,
+                        showManualEmailFallback = showManualEmailFallback,
+                        isConfirmingPayment = isConfirmingPayment,
+                        isSignUp = isSignUp,
+                        email = email,
+                        password = password,
+                        passwordVisible = passwordVisible,
+                        isLoading = isLoading,
+                        authError = authError,
+                        deviceLinkAuthState = deviceLinkAuthState,
+                        deviceLinkEnabled = deviceLinkEnabled,
+                        metrics = formMetrics,
+                        scale = scale,
+                        onEmailChange = onEmailChange,
+                        onPasswordChange = onPasswordChange,
+                        onPasswordVisibilityToggle = onPasswordVisibilityToggle,
+                        onSubmit = onSubmit,
+                        onToggleAuthMode = onToggleAuthMode,
+                        onStartCheckout = onStartCheckout,
+                        onManualCheckEmailChange = onManualCheckEmailChange,
+                        onProceedPaid = onProceedPaid,
+                        onOpenExistingAccountLogin = onOpenExistingAccountLogin,
+                        onReturnToPaywall = onReturnToPaywall,
+                        onStartDeviceLink = onStartDeviceLink,
+                        onCancelDeviceLink = onCancelDeviceLink,
+                        onEmailBoundsChange = onEmailBoundsChange,
+                        onPasswordBoundsChange = onPasswordBoundsChange,
+                    )
+                }
             }
         }
-    }
-}
-
-@Composable
-private fun AuthBrandLockup(
-    logoHeight: Dp,
-) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        AppBrandWordmark(
-            contentDescription = null,
-            modifier = Modifier.height(logoHeight),
-        )
-        Spacer(modifier = Modifier.height(14.dp))
-        Text(
-            text = stringResource(Res.string.compose_auth_tagline),
-            style = MaterialTheme.typography.bodyMedium.copy(
-                color = AuthTextSecondary,
-                fontSize = 14.sp,
-                lineHeight = 20.sp,
-                fontWeight = FontWeight.Normal,
-            ),
-        )
     }
 }
 
@@ -1169,7 +1258,7 @@ private fun AuthForm(
                 Text(
                     text = "← Voltar para Informações do Plano",
                     style = MaterialTheme.typography.bodyMedium.copy(
-                        color = Color(0xFF38BDF8),
+                        color = AuthAccentBlueSoft,
                         fontWeight = FontWeight.SemiBold,
                     ),
                 )
@@ -1179,8 +1268,8 @@ private fun AuthForm(
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    color = Color(0xFF22C55E).copy(alpha = 0.12f),
-                    border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+                    color = AuthAccentBlue.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, AuthAccentBlueBright.copy(alpha = 0.45f)),
                 ) {
                     Text(
                         text = if (isSignUp) {
@@ -1189,7 +1278,7 @@ private fun AuthForm(
                             "✓ PIX já aprovado para $verifiedPaidEmail! Esta conta Host já possui cadastro — entre com sua senha abaixo."
                         },
                         style = MaterialTheme.typography.bodySmall.copy(
-                            color = Color(0xFF4ADE80),
+                            color = Color(0xFF93C5FD),
                             fontWeight = FontWeight.SemiBold,
                             fontSize = (12.5f * scale).sp,
                             lineHeight = (18f * scale).sp,
@@ -1329,7 +1418,7 @@ private fun AuthTextField(
             .background(metrics.fieldBackground, shape)
             .border(
                 1.dp,
-                if (readOnly) Color(0xFF22C55E).copy(alpha = 0.55f) else AuthFieldBorder,
+                if (readOnly) AuthAccentBlueBright.copy(alpha = 0.65f) else AuthFieldBorder,
                 shape,
             )
             .padding(horizontal = metrics.fieldHorizontalPadding),
@@ -1339,7 +1428,7 @@ private fun AuthTextField(
             imageVector = icon,
             contentDescription = null,
             modifier = Modifier.size(metrics.iconSize),
-            tint = if (readOnly) Color(0xFF4ADE80) else AuthTextMuted,
+            tint = if (readOnly) AuthAccentBlueSoft else AuthTextMuted,
         )
         Spacer(modifier = Modifier.width(12.dp))
         BasicTextField(
@@ -1421,6 +1510,10 @@ internal fun AuthPrimaryButton(
             .height(height),
         enabled = enabled,
         shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(
+            1.dp,
+            if (enabled) AuthAccentBlueSoft.copy(alpha = 0.36f) else AuthAccentBlue.copy(alpha = 0.16f),
+        ),
         contentPadding = PaddingValues(0.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = AuthPrimaryButtonBackground,
@@ -1492,7 +1585,7 @@ private fun AuthModeToggle(
                 else stringResource(Res.string.compose_auth_sign_up),
                 modifier = Modifier.clickable(onClick = onToggleAuthMode),
                 style = MaterialTheme.typography.bodyMedium.copy(
-                    color = AuthTextPrimary,
+                    color = AuthAccentBlueSoft,
                     fontSize = (14f * scale).sp,
                     lineHeight = (20f * scale).sp,
                     fontWeight = FontWeight.SemiBold,
@@ -1586,25 +1679,19 @@ private fun Modifier.authGradientBackground(largeScreen: Boolean): Modifier = dr
     )
     val colorStops = if (largeScreen) {
         arrayOf(
-            0f to Color(0xFF21113B),
-            0.14f to Color(0xFF21113B),
-            0.26f to Color(0xFF1A0E2F),
-            0.36f to Color(0xFF130A23),
-            0.48f to Color(0xFF0A060F),
-            0.60f to Color(0xFF050408),
-            0.70f to Color.Black,
-            1f to Color.Black,
+            0f to Color(0xFF0B152A),
+            0.16f to Color(0xFF0A1121),
+            0.34f to Color(0xFF080B12),
+            0.58f to Color(0xFF07080B),
+            1f to Color(0xFF050608),
         )
     } else {
         arrayOf(
-            0f to Color(0xFF21113B),
-            0.12f to Color(0xFF21113B),
-            0.24f to Color(0xFF1A0E2F),
-            0.34f to Color(0xFF130A23),
-            0.44f to Color(0xFF0A060F),
-            0.58f to Color(0xFF050408),
-            0.64f to Color.Black,
-            1f to Color.Black,
+            0f to Color(0xFF0B152B),
+            0.18f to Color(0xFF090E1A),
+            0.38f to Color(0xFF07090D),
+            0.65f to Color(0xFF06070A),
+            1f to Color(0xFF050608),
         )
     }
     val brush = Brush.linearGradient(
@@ -1628,7 +1715,7 @@ private fun LayoutCoordinates.boundsInRoot(): Rect {
 }
 
 @Composable
-private fun AppPaywallPreCheckoutSection(
+internal fun AppPaywallPreCheckoutSection(
     metrics: AuthFormMetrics,
     scale: Float,
     primaryHeight: Dp,
@@ -1650,57 +1737,57 @@ private fun AppPaywallPreCheckoutSection(
     ) {
         Surface(
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
-            color = Color(0xFF131722),
-            border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+            shape = RoundedCornerShape(22.dp),
+            color = Color(0xFF0C1018),
+            border = BorderStroke(1.dp, AuthAccentBlue.copy(alpha = 0.34f)),
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(20.dp * scale),
+                    .padding(18.dp * scale),
             ) {
                 Surface(
                     shape = RoundedCornerShape(999.dp),
-                    color = Color(0xFF22C55E).copy(alpha = 0.12f),
-                    border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+                    color = AuthAccentBlue.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, AuthAccentBlueBright.copy(alpha = 0.38f)),
                 ) {
                     Text(
                         text = "🔒 ACESSO RESTRITO POR ASSINATURA",
                         style = MaterialTheme.typography.labelSmall.copy(
-                            color = Color(0xFF4ADE80),
+                            color = AuthAccentBlueSoft,
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 0.5.sp,
-                            fontSize = (11f * scale).sp,
+                            fontSize = (10.5f * scale).sp,
                         ),
-                        modifier = Modifier.padding(horizontal = 10.dp * scale, vertical = 5.dp * scale),
+                        modifier = Modifier.padding(horizontal = 10.dp * scale, vertical = 4.dp * scale),
                     )
                 }
 
-                Spacer(modifier = Modifier.height(14.dp * scale))
+                Spacer(modifier = Modifier.height(12.dp * scale))
 
                 Text(
                     text = "Libere o Acesso ao Cine Ultimate",
                     style = MaterialTheme.typography.titleLarge.copy(
-                        color = Color.White,
+                        color = AuthTextPrimary,
                         fontWeight = FontWeight.Bold,
-                        fontSize = (20f * scale).sp,
+                        fontSize = (19f * scale).sp,
                     ),
                 )
 
-                Spacer(modifier = Modifier.height(6.dp * scale))
+                Spacer(modifier = Modifier.height(5.dp * scale))
 
                 Text(
                     text = "Para assistir a milhares de filmes, séries, canais ao vivo em 4K e curtir a Sala Cinema 3D, realize o pagamento único de $priceLabel no site oficial.",
                     style = MaterialTheme.typography.bodyMedium.copy(
-                        color = Color(0xFF94A3B8),
-                        fontSize = (13f * scale).sp,
-                        lineHeight = (19f * scale).sp,
+                        color = Color(0xFF93A3BD),
+                        fontSize = (12.5f * scale).sp,
+                        lineHeight = (18f * scale).sp,
                     ),
                 )
 
-                Spacer(modifier = Modifier.height(16.dp * scale))
+                Spacer(modifier = Modifier.height(14.dp * scale))
 
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp * scale)) {
+                Column(verticalArrangement = Arrangement.spacedBy(7.dp * scale)) {
                     PaywallBenefitItem("✓ Pagamento Único de $priceLabel (Sem mensalidade)", scale)
                     PaywallBenefitItem("✓ Canais Ao Vivo 4K & Full HD", scale)
                     PaywallBenefitItem("✓ Catálogo completo de Filmes e Séries", scale)
@@ -1708,63 +1795,63 @@ private fun AppPaywallPreCheckoutSection(
                     PaywallBenefitItem("✓ Liberação automática após o PIX no site", scale)
                 }
 
-                Spacer(modifier = Modifier.height(16.dp * scale))
+                Spacer(modifier = Modifier.height(14.dp * scale))
 
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    color = Color(0xFFF59E0B).copy(alpha = 0.12f),
-                    border = BorderStroke(1.dp, Color(0xFFF59E0B).copy(alpha = 0.4f)),
+                    color = Color(0xFFF59E0B).copy(alpha = 0.10f),
+                    border = BorderStroke(1.dp, Color(0xFFF59E0B).copy(alpha = 0.34f)),
                 ) {
                     Text(
                         text = "⚠️ Importante: Use o mesmo Gmail do pagamento no site para liberar automaticamente sua conta no app.",
                         style = MaterialTheme.typography.bodySmall.copy(
                             color = Color(0xFFFDE68A),
                             fontWeight = FontWeight.SemiBold,
-                            fontSize = (12.5f * scale).sp,
-                            lineHeight = (18f * scale).sp,
+                            fontSize = (12f * scale).sp,
+                            lineHeight = (17f * scale).sp,
                         ),
-                        modifier = Modifier.padding(horizontal = 12.dp * scale, vertical = 10.dp * scale),
+                        modifier = Modifier.padding(horizontal = 12.dp * scale, vertical = 9.dp * scale),
                     )
                 }
 
                 if (isWaitingPayment) {
-                    Spacer(modifier = Modifier.height(14.dp * scale))
+                    Spacer(modifier = Modifier.height(12.dp * scale))
                     if (confirmedPaidEmail != null) {
                         Surface(
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(12.dp),
-                            color = Color(0xFF22C55E).copy(alpha = 0.16f),
-                            border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.55f)),
+                            color = AuthAccentBlue.copy(alpha = 0.20f),
+                            border = BorderStroke(1.dp, AuthAccentBlueBright.copy(alpha = 0.62f)),
                         ) {
                             Text(
                                 text = "✓ Pagamento PIX de $priceLabel confirmado para $confirmedPaidEmail! Toque abaixo para prosseguir.",
                                 style = MaterialTheme.typography.bodySmall.copy(
-                                    color = Color(0xFF4ADE80),
+                                    color = Color(0xFF93C5FD),
                                     fontWeight = FontWeight.Bold,
-                                    fontSize = (13f * scale).sp,
-                                    lineHeight = (18f * scale).sp,
+                                    fontSize = (12.5f * scale).sp,
+                                    lineHeight = (17.5f * scale).sp,
                                 ),
-                                modifier = Modifier.padding(horizontal = 12.dp * scale, vertical = 12.dp * scale),
+                                modifier = Modifier.padding(horizontal = 12.dp * scale, vertical = 10.dp * scale),
                             )
                         }
                     } else {
                         Surface(
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(12.dp),
-                            color = Color(0xFF22C55E).copy(alpha = 0.10f),
-                            border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.35f)),
+                            color = Color(0xFF0E1627),
+                            border = BorderStroke(1.dp, AuthAccentBlueBright.copy(alpha = 0.36f)),
                         ) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 12.dp * scale, vertical = 10.dp * scale),
+                                    .padding(horizontal = 12.dp * scale, vertical = 9.dp * scale),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp * scale),
                             ) {
                                 NuvioLoadingIndicator(
-                                    size = 20.dp * scale,
-                                    color = Color(0xFF4ADE80),
+                                    size = 18.dp * scale,
+                                    color = AuthAccentBlueSoft,
                                 )
                                 Text(
                                     text = if (showManualEmailFallback) {
@@ -1773,9 +1860,9 @@ private fun AppPaywallPreCheckoutSection(
                                         "⏳ Confirmando seu PIX automaticamente... Assim que o pagamento for aprovado, o botão para prosseguir aparecerá aqui."
                                     },
                                     style = MaterialTheme.typography.bodySmall.copy(
-                                        color = Color(0xFFBBF7D0),
-                                        fontSize = (12.5f * scale).sp,
-                                        lineHeight = (18f * scale).sp,
+                                        color = Color(0xFFBFDBFE),
+                                        fontSize = (12f * scale).sp,
+                                        lineHeight = (17f * scale).sp,
                                     ),
                                     modifier = Modifier.weight(1f),
                                 )
@@ -1783,7 +1870,7 @@ private fun AppPaywallPreCheckoutSection(
                         }
 
                         if (showManualEmailFallback) {
-                            Spacer(modifier = Modifier.height(12.dp * scale))
+                            Spacer(modifier = Modifier.height(10.dp * scale))
                             AuthTextField(
                                 value = manualCheckEmail,
                                 onValueChange = onManualCheckEmailChange,
@@ -1804,7 +1891,7 @@ private fun AppPaywallPreCheckoutSection(
                 }
 
                 authError?.let { errorText ->
-                    Spacer(modifier = Modifier.height(12.dp * scale))
+                    Spacer(modifier = Modifier.height(10.dp * scale))
                     Text(
                         text = errorText,
                         style = MaterialTheme.typography.bodyMedium.copy(
@@ -1815,7 +1902,7 @@ private fun AppPaywallPreCheckoutSection(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(18.dp * scale))
+                Spacer(modifier = Modifier.height(14.dp * scale))
 
                 if (isWaitingPayment && (confirmedPaidEmail != null || showManualEmailFallback)) {
                     Button(
@@ -1825,10 +1912,11 @@ private fun AppPaywallPreCheckoutSection(
                             .fillMaxWidth()
                             .height(primaryHeight),
                         shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, AuthAccentBlueSoft.copy(alpha = 0.40f)),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF22C55E),
+                            containerColor = AuthAccentBlue,
                             contentColor = Color.White,
-                            disabledContainerColor = Color(0xFF22C55E).copy(alpha = 0.55f),
+                            disabledContainerColor = AuthAccentBlue.copy(alpha = 0.55f),
                             disabledContentColor = Color.White.copy(alpha = 0.8f),
                         ),
                     ) {
@@ -1840,15 +1928,17 @@ private fun AppPaywallPreCheckoutSection(
                         } else {
                             Text(
                                 text = "✓ Já fiz o pagamento • Prosseguir →",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 style = MaterialTheme.typography.titleMedium.copy(
                                     fontWeight = FontWeight.Bold,
-                                    fontSize = (15f * scale).sp,
+                                    fontSize = (14.5f * scale).sp,
                                 ),
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp * scale))
+                    Spacer(modifier = Modifier.height(9.dp * scale))
 
                     AuthSecondaryButton(
                         text = "🌐 Reabrir Site de Pagamento PIX",
@@ -1864,16 +1954,19 @@ private fun AppPaywallPreCheckoutSection(
                             .fillMaxWidth()
                             .height(primaryHeight),
                         shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, AuthAccentBlueSoft.copy(alpha = 0.40f)),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF22C55E),
+                            containerColor = AuthAccentBlue,
                             contentColor = Color.White,
                         ),
                     ) {
                         Text(
                             text = if (isWaitingPayment) "🌐 Reabrir Site de Pagamento PIX" else "⚡ Pagar $priceLabel no Site e Liberar",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             style = MaterialTheme.typography.titleMedium.copy(
                                 fontWeight = FontWeight.Bold,
-                                fontSize = (15f * scale).sp,
+                                fontSize = (14.5f * scale).sp,
                             ),
                         )
                     }
@@ -1881,13 +1974,14 @@ private fun AppPaywallPreCheckoutSection(
             }
         }
 
-        Spacer(modifier = Modifier.height(10.dp * scale))
+        Spacer(modifier = Modifier.height(8.dp * scale))
 
         TextButton(onClick = onOpenExistingAccountLogin) {
             Text(
                 text = "Já possui conta e senha cadastradas? Fazer Login",
                 style = MaterialTheme.typography.bodySmall.copy(
-                    color = AuthTextSecondary,
+                    color = AuthAccentBlueSoft,
+                    fontWeight = FontWeight.SemiBold,
                     fontSize = (13f * scale).sp,
                 ),
             )
@@ -1897,9 +1991,21 @@ private fun AppPaywallPreCheckoutSection(
 
 @Composable
 private fun PaywallBenefitItem(text: String, scale: Float) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    val cleanLabel = text.removePrefix("✓ ").removePrefix("✓").trimStart()
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
         Text(
-            text = text,
+            text = "✓",
+            style = MaterialTheme.typography.bodySmall.copy(
+                color = AuthAccentBlueSoft,
+                fontWeight = FontWeight.Bold,
+                fontSize = (12.5f * scale).sp,
+            ),
+        )
+        Text(
+            text = cleanLabel,
             style = MaterialTheme.typography.bodySmall.copy(
                 color = Color(0xFFE2E8F0),
                 fontWeight = FontWeight.Medium,
