@@ -22,7 +22,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [28, 34])
+@Config(sdk = [28, 34], qualifiers = "w600dp-h960dp")
 class AuthSmokeScreenTest {
 
     @get:Rule
