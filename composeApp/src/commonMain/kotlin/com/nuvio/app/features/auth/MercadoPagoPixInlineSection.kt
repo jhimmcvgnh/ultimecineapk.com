@@ -38,6 +38,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.core.auth.CineAuthClient
 import com.nuvio.app.features.addons.httpRequestRaw
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -89,6 +91,8 @@ internal fun MercadoPagoPixInlineSection(
 ) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
+    val planInfo by CineAuthClient.planInfo.collectAsStateWithLifecycle()
+    val priceLabel = planInfo.formattedPrice
     var modalOpen by remember { mutableStateOf(false) }
     var name by remember { mutableStateOf("") }
     var email by remember(prefillEmail) { mutableStateOf(prefillEmail) }
@@ -107,7 +111,7 @@ internal fun MercadoPagoPixInlineSection(
         val payment = activePayment ?: return@LaunchedEffect
         if (isApproved || payment.paymentId.isBlank()) return@LaunchedEffect
         while (!isApproved) {
-            delay(4500L)
+            delay(1500L)
             runCatching {
                 val res = httpRequestRaw(
                     method = "GET",
@@ -147,7 +151,7 @@ internal fun MercadoPagoPixInlineSection(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = "⚡ PIX MERCADO PAGO • PLANO R$ 10,00",
+                        text = "⚡ PIX MERCADO PAGO • PLANO $priceLabel",
                         color = Color(0xFF4DD0E1),
                         fontSize = (11f * scale).sp,
                         fontWeight = FontWeight.Bold,
@@ -180,7 +184,7 @@ internal fun MercadoPagoPixInlineSection(
                     activePayment != null -> {
                         val pay = activePayment!!
                         Text(
-                            text = "PIX de R$ 10,00 gerado para ${pay.email}",
+                            text = "PIX de $priceLabel gerado para ${pay.email}",
                             color = AuthTextPrimary,
                             fontSize = (13.5f * scale).sp,
                             fontWeight = FontWeight.SemiBold,
@@ -324,7 +328,7 @@ internal fun MercadoPagoPixInlineSection(
                             ),
                         ) {
                             Text(
-                                text = if (isSubmitting) "Gerando PIX..." else "⚡ Gerar PIX de R$ 10,00",
+                                text = if (isSubmitting) "Gerando PIX..." else "⚡ Gerar PIX de $priceLabel",
                                 fontWeight = FontWeight.Bold,
                             )
                         }
@@ -334,7 +338,7 @@ internal fun MercadoPagoPixInlineSection(
         }
 
         AuthSecondaryButton(
-            text = "⚡ Liberar Acesso — Plano R$ 10,00 (PIX)",
+            text = "⚡ Liberar Acesso — Plano $priceLabel (PIX)",
             enabled = true,
             height = height,
             scale = scale,

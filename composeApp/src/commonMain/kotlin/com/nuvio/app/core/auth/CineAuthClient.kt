@@ -13,6 +13,11 @@ import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.contentLength
 import io.ktor.http.encodeURLParameter
+import kotlin.math.abs
+import kotlin.math.roundToInt
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -20,6 +25,12 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
+
+internal data class CinePlanInfo(
+    val id: String = "plano_unico_29",
+    val amount: Double = 29.0,
+    val formattedPrice: String = "R$ 29,00",
+)
 
 internal data class CheckEmailResult(
     val email: String,
@@ -31,6 +42,7 @@ internal data class SessionStatusResult(
     val approved: Boolean,
     val email: String,
     val hasAccount: Boolean,
+    val paymentId: String? = null,
     val endpointUnavailable: Boolean = false,
 )
 
@@ -77,11 +89,25 @@ private data class CheckEmailApiResponse(
 )
 
 @Serializable
+private data class HealthPlanDto(
+    val id: String? = null,
+    val amount: Double? = null,
+    val formattedAmount: String? = null,
+)
+
+@Serializable
+private data class HealthApiResponse(
+    val status: String? = null,
+    val plan: HealthPlanDto? = null,
+)
+
+@Serializable
 private data class SessionStatusApiResponse(
     val ok: Boolean = false,
     val approved: Boolean = false,
     val email: String = "",
     val hasAccount: Boolean = false,
+    val paymentId: String? = null,
     val error: String? = null,
 )
 
@@ -106,6 +132,37 @@ private data class AuthApiResponse(
 internal object CineAuthClient {
     private val http: HttpClient by lazy { createApiHttpClient() }
     private val json = Json { ignoreUnknownKeys = true }
+    private val _planInfo = MutableStateFlow(CinePlanInfo())
+    val planInfo: StateFlow<CinePlanInfo> = _planInfo.asStateFlow()
+
+    fun currentFormattedPrice(): String = _planInfo.value.formattedPrice
+
+    suspend fun refreshPlanInfo(): Result<CinePlanInfo> = runCatching {
+        val response = http.get("${CineBackendConfig.baseUrl}/api/health") {
+            timeout {
+                connectTimeoutMillis = 3_500
+                socketTimeoutMillis = 4_000
+                requestTimeoutMillis = 4_000
+            }
+            header("Accept", "application/json")
+        }
+        val rawBody = readBoundedResponseBody(response.bodyAsChannel(), response.contentLength())
+        val parsed = json.decodeFromString<HealthApiResponse>(rawBody)
+        val plan = parsed.plan
+        val amount = plan?.amount
+        if (response.status.value in 200..299 && amount != null && amount > 0.0) {
+            val formatted = plan.formattedAmount?.trim()?.takeIf { it.isNotBlank() } ?: formatBrl(amount)
+            val updated = CinePlanInfo(
+                id = plan.id?.trim()?.takeIf { it.isNotBlank() } ?: _planInfo.value.id,
+                amount = amount,
+                formattedPrice = formatted,
+            )
+            _planInfo.value = updated
+            updated
+        } else {
+            _planInfo.value
+        }
+    }
 
     suspend fun checkEmail(email: String, paymentId: String? = null): Result<CheckEmailResult> = runCatching {
         val normalized = email.trim().lowercase()
@@ -116,9 +173,9 @@ internal object CineAuthClient {
 
         val response = http.post("${CineBackendConfig.baseUrl}/api/auth/check-email") {
             timeout {
-                connectTimeoutMillis = 5_000
-                socketTimeoutMillis = 8_000
-                requestTimeoutMillis = 8_000
+                connectTimeoutMillis = 4_000
+                socketTimeoutMillis = 5_000
+                requestTimeoutMillis = 5_000
             }
             header("Content-Type", "application/json")
             header("Accept", "application/json")
@@ -140,9 +197,9 @@ internal object CineAuthClient {
         val encoded = sessionId.trim().encodeURLParameter()
         val response = http.get("${CineBackendConfig.baseUrl}/api/pix/session-status?sessionId=$encoded") {
             timeout {
-                connectTimeoutMillis = 5_000
-                socketTimeoutMillis = 8_000
-                requestTimeoutMillis = 8_000
+                connectTimeoutMillis = 4_000
+                socketTimeoutMillis = 5_000
+                requestTimeoutMillis = 5_000
             }
             header("Accept", "application/json")
         }
@@ -163,6 +220,7 @@ internal object CineAuthClient {
             approved = parsed.approved,
             email = parsed.email.trim().lowercase(),
             hasAccount = parsed.hasAccount,
+            paymentId = parsed.paymentId?.trim()?.takeIf { it.isNotBlank() },
         )
     }
 
@@ -182,7 +240,7 @@ internal object CineAuthClient {
         if (!parsed.user.subscriptionActive) {
             throw CineAuthException(
                 code = "PAYMENT_REQUIRED",
-                message = "Acesso negado: Este Gmail não possui pagamento de R$ 10,00 aprovado.",
+                message = "Acesso negado: Este Gmail não possui pagamento de ${currentFormattedPrice()} aprovado.",
             )
         }
         return CineAuthSuccess(
@@ -324,5 +382,14 @@ internal object CineAuthClient {
         val user = json.decodeFromString<SupabaseAuthUserDto>(rawBody)
         user.user_metadata?.get("cine_profiles") as? JsonArray
     }
+}
+
+internal fun formatBrl(amount: Double): String {
+    val totalCents = (amount * 100.0).roundToInt()
+    val sign = if (totalCents < 0) "-" else ""
+    val absCents = abs(totalCents)
+    val reais = absCents / 100
+    val centavos = absCents % 100
+    return "${sign}R$ $reais,${centavos.toString().padStart(2, '0')}"
 }
 

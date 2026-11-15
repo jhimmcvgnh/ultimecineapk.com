@@ -104,6 +104,8 @@ import kotlin.math.PI
 import kotlin.math.sin
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
@@ -207,6 +209,8 @@ fun AuthScreen(
     val serverConnectionState by ServerConnectionController.state.collectAsStateWithLifecycle()
     val pendingDeepLink by AppDeepLinkRepository.pendingDeepLink.collectAsStateWithLifecycle()
     val appVisibility by AppForegroundMonitor.events().collectAsStateWithLifecycle(initialValue = AppVisibility.Foreground)
+    val planInfo by CineAuthClient.planInfo.collectAsStateWithLifecycle()
+    val priceLabel = planInfo.formattedPrice
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val uriHandler = LocalUriHandler.current
@@ -296,6 +300,12 @@ fun AuthScreen(
         )
     }
 
+    LaunchedEffect(appVisibility) {
+        if (appVisibility == AppVisibility.Foreground) {
+            CineAuthClient.refreshPlanInfo()
+        }
+    }
+
     LaunchedEffect(pendingDeepLink) {
         val deepLink = pendingDeepLink
         if (deepLink is AppDeepLink.PaymentApproved) {
@@ -329,7 +339,7 @@ fun AuthScreen(
                             paymentId = deepLink.paymentId,
                         )
                     } else {
-                        localError = "Acesso negado: O Gmail $paidEmail ainda não possui pagamento PIX de R$ 10,00 aprovado."
+                        localError = "Acesso negado: O Gmail $paidEmail ainda não possui pagamento PIX de ${CineAuthClient.currentFormattedPrice()} aprovado."
                         showLoginScreen = false
                     }
                 } else {
@@ -353,7 +363,12 @@ fun AuthScreen(
 
         repeat(600) { attempt ->
             if (attempt > 0) {
-                delay(if (appVisibility == AppVisibility.Foreground) 1_000L else 3_000L)
+                val intervalMs = when {
+                    appVisibility != AppVisibility.Foreground -> 2_500L
+                    attempt < 45 -> 700L
+                    else -> 1_200L
+                }
+                delay(intervalMs)
             }
             val statusResult = CineAuthClient.checkSessionStatus(sessionId)
             val status = statusResult.getOrNull() ?: return@repeat
@@ -361,15 +376,21 @@ fun AuthScreen(
                 showManualEmailFallback = true
                 return@LaunchedEffect
             }
+            if (!status.paymentId.isNullOrBlank()) {
+                confirmedPaymentId = status.paymentId
+            }
             if (status.approved && status.email.isNotBlank()) {
+                val resolvedPaymentId = status.paymentId?.takeIf { it.isNotBlank() } ?: confirmedPaymentId
                 confirmedPaidEmail = status.email
                 confirmedPaidHasAccount = status.hasAccount
+                confirmedPaymentId = resolvedPaymentId
                 localError = null
                 AuthRepository.clearError()
                 syncPersistedPaymentState(
                     pendingSessionId = sessionId,
                     paidEmail = status.email,
                     hasAccount = status.hasAccount,
+                    paymentId = resolvedPaymentId,
                 )
                 return@LaunchedEffect
             }
@@ -379,7 +400,7 @@ fun AuthScreen(
     LaunchedEffect(activeCheckoutSessionId, showLoginScreen, confirmedPaidEmail) {
         val sessionId = activeCheckoutSessionId ?: return@LaunchedEffect
         if (showLoginScreen || confirmedPaidEmail != null || showManualEmailFallback) return@LaunchedEffect
-        delay(12_000L)
+        delay(8_000L)
         if (activeCheckoutSessionId == sessionId && confirmedPaidEmail == null && !showLoginScreen) {
             showManualEmailFallback = true
         }
@@ -420,33 +441,50 @@ fun AuthScreen(
 
         val sessionId = activeCheckoutSessionId
         val typedEmail = manualCheckEmail.trim().lowercase()
+        val hasTypedEmail = typedEmail.contains("@") && typedEmail.contains(".")
+        val querySessionId = sessionId?.takeIf { it != "chk_deeplink" && it != "chk_restored" }
         isConfirmingPayment = true
         scope.launch {
-            val sessionStatus = sessionId
-                ?.takeIf { it != "chk_deeplink" && it != "chk_restored" }
-                ?.let { CineAuthClient.checkSessionStatus(it).getOrNull() }
-            if (sessionStatus != null && sessionStatus.approved && sessionStatus.email.isNotBlank()) {
-                unlockWithConfirmedPayment(sessionStatus.email, sessionStatus.hasAccount)
-                return@launch
-            }
+            coroutineScope {
+                val sessionDeferred = querySessionId?.let { id ->
+                    async { CineAuthClient.checkSessionStatus(id).getOrNull() }
+                }
+                val emailDeferred = if (hasTypedEmail) {
+                    async { CineAuthClient.checkEmail(typedEmail, confirmedPaymentId) }
+                } else {
+                    null
+                }
 
-            if (typedEmail.contains("@") && typedEmail.contains(".")) {
-                val check = CineAuthClient.checkEmail(typedEmail, confirmedPaymentId)
-                isConfirmingPayment = false
-                if (check.isSuccess) {
-                    val info = check.getOrThrow()
-                    if (info.entitlementActive) {
-                        unlockWithConfirmedPayment(info.email, info.hasAccount)
+                val sessionStatus = sessionDeferred?.await()
+                if (sessionStatus != null) {
+                    if (!sessionStatus.paymentId.isNullOrBlank()) {
+                        confirmedPaymentId = sessionStatus.paymentId
+                    }
+                    if (sessionStatus.approved && sessionStatus.email.isNotBlank()) {
+                        emailDeferred?.cancel()
+                        unlockWithConfirmedPayment(sessionStatus.email, sessionStatus.hasAccount)
+                        return@coroutineScope
+                    }
+                }
+
+                if (emailDeferred != null) {
+                    val check = emailDeferred.await()
+                    isConfirmingPayment = false
+                    if (check.isSuccess) {
+                        val info = check.getOrThrow()
+                        if (info.entitlementActive) {
+                            unlockWithConfirmedPayment(info.email, info.hasAccount)
+                        } else {
+                            localError = "Pagamento PIX de ${CineAuthClient.currentFormattedPrice()} ainda não confirmado para ${info.email}. Conclua o PIX no site ou aguarde alguns segundos e tente novamente."
+                        }
                     } else {
-                        localError = "Pagamento PIX de R$ 10,00 ainda não confirmado para ${info.email}. Conclua o PIX no site ou aguarde alguns segundos e tente novamente."
+                        localError = check.exceptionOrNull()?.message
+                            ?: "Não foi possível confirmar o pagamento agora. Tente novamente em instantes."
                     }
                 } else {
-                    localError = check.exceptionOrNull()?.message
-                        ?: "Não foi possível confirmar o pagamento agora. Tente novamente em instantes."
+                    isConfirmingPayment = false
+                    localError = "Confirmação automática pendente. Digite o mesmo Gmail usado no PIX do site para confirmar e prosseguir."
                 }
-            } else {
-                isConfirmingPayment = false
-                localError = "Confirmação automática pendente. Digite o mesmo Gmail usado no PIX do site para confirmar e prosseguir."
             }
         }
     }
@@ -564,6 +602,7 @@ fun AuthScreen(
                     AuthLargeLayout(
                         modifier = Modifier.fillMaxSize(),
                         showLoginScreen = showLoginScreen,
+                        priceLabel = priceLabel,
                         verifiedPaidEmail = verifiedPaidEmail,
                         isWaitingPayment = activeCheckoutSessionId != null && !showLoginScreen,
                         confirmedPaidEmail = confirmedPaidEmail,
@@ -615,6 +654,7 @@ fun AuthScreen(
                 } else {
                     AuthMobileLayout(
                         showLoginScreen = showLoginScreen,
+                        priceLabel = priceLabel,
                         verifiedPaidEmail = verifiedPaidEmail,
                         isWaitingPayment = activeCheckoutSessionId != null && !showLoginScreen,
                         confirmedPaidEmail = confirmedPaidEmail,
@@ -727,6 +767,7 @@ fun AuthScreen(
 @Composable
 private fun AuthMobileLayout(
     showLoginScreen: Boolean,
+    priceLabel: String,
     verifiedPaidEmail: String?,
     isWaitingPayment: Boolean,
     confirmedPaidEmail: String?,
@@ -801,6 +842,7 @@ private fun AuthMobileLayout(
 
             AuthForm(
                 showLoginScreen = showLoginScreen,
+                priceLabel = priceLabel,
                 verifiedPaidEmail = verifiedPaidEmail,
                 isWaitingPayment = isWaitingPayment,
                 confirmedPaidEmail = confirmedPaidEmail,
@@ -839,6 +881,7 @@ private fun AuthMobileLayout(
 private fun AuthLargeLayout(
     modifier: Modifier = Modifier,
     showLoginScreen: Boolean,
+    priceLabel: String,
     verifiedPaidEmail: String?,
     isWaitingPayment: Boolean,
     confirmedPaidEmail: String?,
@@ -955,6 +998,7 @@ private fun AuthLargeLayout(
 
                 AuthForm(
                     showLoginScreen = showLoginScreen,
+                    priceLabel = priceLabel,
                     verifiedPaidEmail = verifiedPaidEmail,
                     isWaitingPayment = isWaitingPayment,
                     confirmedPaidEmail = confirmedPaidEmail,
@@ -1065,6 +1109,7 @@ private fun AuthHeading(
 @Composable
 private fun AuthForm(
     showLoginScreen: Boolean,
+    priceLabel: String,
     verifiedPaidEmail: String?,
     isWaitingPayment: Boolean,
     confirmedPaidEmail: String?,
@@ -1104,6 +1149,7 @@ private fun AuthForm(
                 metrics = metrics,
                 scale = scale,
                 primaryHeight = metrics.primaryHeight,
+                priceLabel = priceLabel,
                 isWaitingPayment = isWaitingPayment,
                 confirmedPaidEmail = confirmedPaidEmail,
                 manualCheckEmail = manualCheckEmail,
@@ -1138,7 +1184,7 @@ private fun AuthForm(
                 ) {
                     Text(
                         text = if (isSignUp) {
-                            "✓ PIX de R$ 10,00 aprovado! Crie sua Conta Principal (Host) com o mesmo Gmail da compra ($verifiedPaidEmail) e escolha sua senha. Depois você poderá criar vários perfis."
+                            "✓ PIX de $priceLabel aprovado! Crie sua Conta Principal (Host) com o mesmo Gmail da compra ($verifiedPaidEmail) e escolha sua senha. Depois você poderá criar vários perfis."
                         } else {
                             "✓ PIX já aprovado para $verifiedPaidEmail! Esta conta Host já possui cadastro — entre com sua senha abaixo."
                         },
@@ -1235,7 +1281,7 @@ private fun AuthForm(
             Spacer(modifier = Modifier.height(metrics.secondaryTop))
 
             AuthSecondaryButton(
-                text = "← Voltar para a Tela de Pagamento PIX (R$ 10,00)",
+                text = "← Voltar para a Tela de Pagamento PIX ($priceLabel)",
                 enabled = !isLoading,
                 height = metrics.secondaryHeight,
                 scale = scale,
@@ -1586,6 +1632,7 @@ private fun AppPaywallPreCheckoutSection(
     metrics: AuthFormMetrics,
     scale: Float,
     primaryHeight: Dp,
+    priceLabel: String,
     isWaitingPayment: Boolean,
     confirmedPaidEmail: String?,
     manualCheckEmail: String,
@@ -1643,7 +1690,7 @@ private fun AppPaywallPreCheckoutSection(
                 Spacer(modifier = Modifier.height(6.dp * scale))
 
                 Text(
-                    text = "Para assistir a milhares de filmes, séries, canais ao vivo em 4K e curtir a Sala Cinema 3D, realize o pagamento único de R$ 10,00 no site oficial.",
+                    text = "Para assistir a milhares de filmes, séries, canais ao vivo em 4K e curtir a Sala Cinema 3D, realize o pagamento único de $priceLabel no site oficial.",
                     style = MaterialTheme.typography.bodyMedium.copy(
                         color = Color(0xFF94A3B8),
                         fontSize = (13f * scale).sp,
@@ -1654,7 +1701,7 @@ private fun AppPaywallPreCheckoutSection(
                 Spacer(modifier = Modifier.height(16.dp * scale))
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp * scale)) {
-                    PaywallBenefitItem("✓ Pagamento Único de R$ 10,00 (Sem mensalidade)", scale)
+                    PaywallBenefitItem("✓ Pagamento Único de $priceLabel (Sem mensalidade)", scale)
                     PaywallBenefitItem("✓ Canais Ao Vivo 4K & Full HD", scale)
                     PaywallBenefitItem("✓ Catálogo completo de Filmes e Séries", scale)
                     PaywallBenefitItem("✓ Sala Cinema 3D com som imersivo", scale)
@@ -1691,7 +1738,7 @@ private fun AppPaywallPreCheckoutSection(
                             border = BorderStroke(1.dp, Color(0xFF22C55E).copy(alpha = 0.55f)),
                         ) {
                             Text(
-                                text = "✓ Pagamento PIX de R$ 10,00 confirmado para $confirmedPaidEmail! Toque abaixo para prosseguir.",
+                                text = "✓ Pagamento PIX de $priceLabel confirmado para $confirmedPaidEmail! Toque abaixo para prosseguir.",
                                 style = MaterialTheme.typography.bodySmall.copy(
                                     color = Color(0xFF4ADE80),
                                     fontWeight = FontWeight.Bold,
@@ -1823,7 +1870,7 @@ private fun AppPaywallPreCheckoutSection(
                         ),
                     ) {
                         Text(
-                            text = if (isWaitingPayment) "🌐 Reabrir Site de Pagamento PIX" else "⚡ Pagar R$ 10,00 no Site e Liberar",
+                            text = if (isWaitingPayment) "🌐 Reabrir Site de Pagamento PIX" else "⚡ Pagar $priceLabel no Site e Liberar",
                             style = MaterialTheme.typography.titleMedium.copy(
                                 fontWeight = FontWeight.Bold,
                                 fontSize = (15f * scale).sp,

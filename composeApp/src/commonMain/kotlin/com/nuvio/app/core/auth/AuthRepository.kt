@@ -189,7 +189,7 @@ object AuthRepository {
             if (!info.entitlementActive) {
                 log.w { "Account $email does not have an active PIX entitlement; clearing session" }
                 clearLocalSessionAfterRemoteInvalidation()
-                _error.value = "Acesso negado: Este Gmail ($email) não possui pagamento aprovado de R$ 10,00."
+                _error.value = "Acesso negado: Este Gmail ($email) não possui pagamento aprovado de ${CineAuthClient.currentFormattedPrice()}."
                 return false
             }
             validatedRemoteUserId = userId
@@ -198,7 +198,7 @@ object AuthRepository {
     }
 
     fun signInAnonymously() {
-        _error.value = "Acesso anônimo não permitido. Realize o pagamento de R$ 10,00 no site oficial para liberar seu acesso."
+        _error.value = "Acesso anônimo não permitido. Realize o pagamento de ${CineAuthClient.currentFormattedPrice()} no site oficial para liberar seu acesso."
         AuthStorage.clearAnonymousUserId()
         _state.value = AuthState.Unauthenticated
     }
@@ -263,7 +263,7 @@ object AuthRepository {
         val backendResult = CineAuthClient.register(normalizedEmail, password)
         if (backendResult.isFailure) {
             val ex = backendResult.exceptionOrNull()
-            val msg = ex?.message ?: "Acesso negado: O Gmail $normalizedEmail não possui pagamento PIX de R$ 10,00 aprovado."
+            val msg = ex?.message ?: "Acesso negado: O Gmail $normalizedEmail não possui pagamento PIX de ${CineAuthClient.currentFormattedPrice()} aprovado."
             _error.value = msg
             return Result.failure(ex ?: Exception(msg))
         }

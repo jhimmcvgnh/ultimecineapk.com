@@ -166,6 +166,7 @@ import com.nuvio.app.features.tracking.TrackingLibraryTab
 import com.nuvio.app.features.tracking.TrackingMembershipApplyResult
 import com.nuvio.app.features.tracking.TrackingProviderId
 import com.nuvio.app.features.tracking.toggleTrackingLibraryMembership
+import com.nuvio.app.features.updater.AppUpdaterController
 import com.nuvio.app.features.updater.AppUpdaterHost
 import com.nuvio.app.features.updater.AppUpdaterPlatform
 import com.nuvio.app.features.updater.rememberAppUpdaterController
@@ -209,6 +210,7 @@ internal fun MainAppContent(
     onActivate: ((AppScreenTab) -> Unit)? = null,
     onTabTitles: ((home: String, search: String, library: String, profile: String, switchProfile: String, addProfile: String) -> Unit)? = null,
     appGateController: AppGateController? = null,
+    sharedAppUpdaterController: AppUpdaterController? = null,
     onRootContentReady: ((Boolean) -> Unit)? = null,
     onSwitchProfile: () -> Unit = {},
 ) {
@@ -235,7 +237,7 @@ internal fun MainAppContent(
                 onLocalPop = if (posterNavigationEnabled) posterNavigation::clear else null,
             )
         }
-        val appUpdaterController = rememberAppUpdaterController()
+        val appUpdaterController = sharedAppUpdaterController ?: rememberAppUpdaterController()
         if (ownsAppRuntime) {
             remember {
                 EpisodeReleaseNotificationsRepository.ensureLoaded()
@@ -1288,10 +1290,7 @@ internal fun MainAppContent(
             selectedContinueWatchingForActions = item
         }
 
-        AppUpdaterHost(
-            controller = appUpdaterController,
-            modifier = Modifier.fillMaxSize(),
-        ) {
+        val mainBody: @Composable () -> Unit = {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -2123,6 +2122,15 @@ internal fun MainAppContent(
             )
 
             }
+        }
+        if (sharedAppUpdaterController == null) {
+            AppUpdaterHost(
+                controller = appUpdaterController,
+                modifier = Modifier.fillMaxSize(),
+                content = mainBody,
+            )
+        } else {
+            mainBody()
         }
 }
 

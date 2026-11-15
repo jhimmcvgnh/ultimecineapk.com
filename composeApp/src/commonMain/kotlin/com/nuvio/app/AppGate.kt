@@ -28,6 +28,8 @@ import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.auth.DeviceSessionRegistration
 import com.nuvio.app.core.network.NetworkCondition
 import com.nuvio.app.core.network.NetworkStatusRepository
+import com.nuvio.app.core.sync.AppForegroundMonitor
+import com.nuvio.app.core.sync.AppVisibility
 import com.nuvio.app.core.sync.SyncManager
 import com.nuvio.app.core.ui.LocalVerticalBarPadding
 import com.nuvio.app.core.ui.NativeProfileSwitcherController
@@ -44,6 +46,8 @@ import com.nuvio.app.features.profiles.ProfileEditScreen
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.profiles.ProfileSelectionScreen
 import com.nuvio.app.features.profiles.profileAvatarImageUrl
+import com.nuvio.app.features.updater.AppUpdaterHost
+import com.nuvio.app.features.updater.rememberAppUpdaterController
 import com.nuvio.app.navigation.AppRoute
 
 private enum class AppGateScreen {
@@ -98,6 +102,15 @@ internal fun AppGate(
             } ?: {},
         )
         return
+    }
+
+    val appUpdaterController = rememberAppUpdaterController()
+    val appVisibility by AppForegroundMonitor.events()
+        .collectAsStateWithLifecycle(initialValue = AppVisibility.Foreground)
+    LaunchedEffect(appVisibility, ownsAppRuntime) {
+        if (ownsAppRuntime && appVisibility == AppVisibility.Foreground) {
+            appUpdaterController.checkForUpdatesIfStale()
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -412,6 +425,10 @@ internal fun AppGate(
         )
     }
 
+    AppUpdaterHost(
+        controller = appUpdaterController,
+        modifier = Modifier.fillMaxSize(),
+    ) {
     Box(modifier = Modifier.fillMaxSize()) {
         AnimatedContent(
             targetState = gateScreen,
@@ -474,6 +491,7 @@ internal fun AppGate(
                             onActivate = onActivate,
                             onTabTitles = onTabTitles,
                             appGateController = appGateController,
+                            sharedAppUpdaterController = appUpdaterController,
                             onRootContentReady = { ready ->
                                 if (ready) {
                                     profileSelectionLoading = false
@@ -578,5 +596,6 @@ internal fun AppGate(
                 }
             }
         }
+    }
     }
 }

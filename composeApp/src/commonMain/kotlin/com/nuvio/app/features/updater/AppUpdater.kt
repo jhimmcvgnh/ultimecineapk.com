@@ -7,6 +7,8 @@ import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.core.build.AppVersionConfig
 import com.nuvio.app.core.i18n.localizedByteUnit
 import com.nuvio.app.core.ui.NuvioToastController
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -54,6 +56,7 @@ class AppUpdaterController internal constructor(
     val uiState: StateFlow<AppUpdaterUiState> = _uiState.asStateFlow()
 
     private var autoCheckStarted = false
+    private var lastCheckMark: TimeMark? = null
     private var updateCheckJob: Job? = null
     private var downloadJob: Job? = null
 
@@ -81,6 +84,23 @@ class AppUpdaterController internal constructor(
         checkForUpdates(force = false, showNoUpdateFeedback = false)
     }
 
+    fun checkForUpdatesIfStale(minIntervalMs: Long = 15L * 60L * 1000L) {
+        if (!AppFeaturePolicy.inAppUpdaterEnabled || !AppUpdaterPlatform.isSupported) return
+        if (_uiState.value.isChecking || _uiState.value.isDownloading) return
+        val mark = lastCheckMark
+        if (mark == null) {
+            if (!autoCheckStarted) {
+                ensureAutoCheckStarted()
+            } else {
+                checkForUpdates(force = false, showNoUpdateFeedback = false)
+            }
+            return
+        }
+        if (mark.elapsedNow().inWholeMilliseconds >= minIntervalMs) {
+            checkForUpdates(force = false, showNoUpdateFeedback = false)
+        }
+    }
+
     fun checkForUpdates(force: Boolean, showNoUpdateFeedback: Boolean) {
         if (!AppFeaturePolicy.inAppUpdaterEnabled || !AppUpdaterPlatform.isSupported) {
             if (showNoUpdateFeedback) {
@@ -92,6 +112,7 @@ class AppUpdaterController internal constructor(
         }
 
         if (_uiState.value.isDownloading) return
+        lastCheckMark = TimeSource.Monotonic.markNow()
         updateCheckJob?.cancel()
         val channel = preferences.channel.value
         updateCheckJob = scope.launch {

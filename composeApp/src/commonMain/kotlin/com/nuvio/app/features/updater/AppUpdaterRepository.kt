@@ -1,6 +1,8 @@
 package com.nuvio.app.features.updater
 
+import com.nuvio.app.core.network.CineBackendConfig
 import com.nuvio.app.features.addons.httpRequestRaw
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.SerialName
@@ -38,22 +40,70 @@ internal object AppUpdaterRepository {
     }
 
     suspend fun getLatestChannelUpdate(channel: UpdateChannel): Result<AppUpdate> = runCatching {
-        val response = httpRequestRaw(
-            method = "GET",
+        val supportedAbis = AppUpdaterPlatform.getSupportedAbis()
+        val githubResult = fetchUpdateFromUrl(
             url = "https://api.github.com/repos/jhimmcvgnh/cine-ultimatefree/${releasePath(channel)}",
             headers = mapOf(
                 "Accept" to "application/vnd.github+json",
                 "User-Agent" to "NuvioMobile",
             ),
-            body = "",
+            channel = channel,
+            supportedAbis = supportedAbis,
         )
-        currentCoroutineContext().ensureActive()
-        if (response.status == 404) throw NoChannelReleaseException()
-        if (response.status !in 200..299) {
-            error(getString(Res.string.updates_github_api_error, response.status))
+        if (githubResult.isSuccess) {
+            return@runCatching githubResult.getOrThrow()
         }
-        selectUpdate(response.body, channel, AppUpdaterPlatform.getSupportedAbis())
-            ?: throw NoChannelReleaseException()
+
+        val fallbackResult = fetchUpdateFromUrl(
+            url = "${CineBackendConfig.baseUrl}/api/app/latest?channel=${channel.storedValue}",
+            headers = mapOf("Accept" to "application/json"),
+            channel = channel,
+            supportedAbis = supportedAbis,
+        )
+        fallbackResult.getOrElse { fallbackErr ->
+            if (fallbackErr is CancellationException) throw fallbackErr
+            val githubErr = githubResult.exceptionOrNull()
+            if (githubErr is CancellationException) throw githubErr
+            throw githubErr?.takeIf { it is NoChannelReleaseException }
+                ?: fallbackErr.takeIf { it is NoChannelReleaseException }
+                ?: githubErr
+                ?: fallbackErr
+        }
+    }
+
+    private suspend fun fetchUpdateFromUrl(
+        url: String,
+        headers: Map<String, String>,
+        channel: UpdateChannel,
+        supportedAbis: List<String>,
+    ): Result<AppUpdate> {
+        return try {
+            val response = httpRequestRaw(
+                method = "GET",
+                url = url,
+                headers = headers,
+                body = "",
+            )
+            currentCoroutineContext().ensureActive()
+            when {
+                response.status == 404 -> Result.failure(NoChannelReleaseException())
+                response.status !in 200..299 -> Result.failure(
+                    IllegalStateException(getString(Res.string.updates_github_api_error, response.status)),
+                )
+                else -> {
+                    val update = selectUpdate(response.body, channel, supportedAbis)
+                    if (update != null) {
+                        Result.success(update)
+                    } else {
+                        Result.failure(NoChannelReleaseException())
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
     }
 
     internal fun releasePath(channel: UpdateChannel): String = when (channel) {
