@@ -42,7 +42,7 @@ internal object AppUpdaterRepository {
     suspend fun getLatestChannelUpdate(channel: UpdateChannel): Result<AppUpdate> = runCatching {
         val supportedAbis = AppUpdaterPlatform.getSupportedAbis()
         val githubResult = fetchUpdateFromUrl(
-            url = "https://api.github.com/repos/jhimmcvgnh/cine-ultimatefree/${releasePath(channel)}",
+            url = "https://api.github.com/repos/jhimmcvgnh/ultimecineapk.com/${releasePath(channel)}",
             headers = mapOf(
                 "Accept" to "application/vnd.github+json",
                 "User-Agent" to "NuvioMobile",
