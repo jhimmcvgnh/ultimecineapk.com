@@ -122,4 +122,46 @@ class AuthSmokeScreenTest {
         assertTrue(proceedClicked)
         assertEquals("", emailValue)
     }
+
+    @Test
+    fun animatedSignInCard_rendersLoginAndVerifiedSignUpAndTriggersCallbacks() {
+        var submitCount = 0
+        var toggleCount = 0
+        var backCount = 0
+
+        composeRule.setContent {
+            MaterialTheme {
+                AnimatedLoginAtmosphere(modifier = Modifier.size(440.dp, 860.dp)) {
+                    AnimatedSignInCard(
+                        priceLabel = "R$ 29,00",
+                        verifiedPaidEmail = "cliente@gmail.com",
+                        isSignUp = true,
+                        email = "cliente@gmail.com",
+                        password = "secret123",
+                        passwordVisible = false,
+                        isLoading = false,
+                        authError = null,
+                        metrics = LargeAuthFormMetrics,
+                        scale = 1f,
+                        headingStyle = MaterialTheme.typography.headlineSmall,
+                        subtitleStyle = MaterialTheme.typography.bodyMedium,
+                        onEmailChange = {},
+                        onPasswordChange = {},
+                        onPasswordVisibilityToggle = {},
+                        onSubmit = { submitCount++ },
+                        onToggleAuthMode = { toggleCount++ },
+                        onReturnToPaywall = { backCount++ },
+                        onEmailBoundsChange = {},
+                        onPasswordBoundsChange = {},
+                    )
+                }
+            }
+        }
+
+        composeRule.onNodeWithText("Criar Conta Principal (Host)").assertIsDisplayed().performClick()
+        assertEquals(1, submitCount)
+        composeRule.onNodeWithText("← Voltar para a Tela de Pagamento PIX (R$ 29,00)").assertIsDisplayed().performClick()
+        assertEquals(1, backCount)
+        assertEquals(0, toggleCount)
+    }
 }
