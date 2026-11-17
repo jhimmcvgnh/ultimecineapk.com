@@ -11,9 +11,9 @@ data class ThemeColorPalette(
     val onSecondaryVariant: Color = Color.White,
     val focusRing: Color,
     val focusBackground: Color,
-    val background: Color = Color(0xFF0D0D0D),
-    val backgroundElevated: Color = Color(0xFF1A1A1A),
-    val backgroundCard: Color = Color(0xFF242424),
+    val background: Color = Color(0xFF06080E),
+    val backgroundElevated: Color = Color(0xFF0C111D),
+    val backgroundCard: Color = Color(0xFF131B2E),
 )
 
 object ThemeColors {
@@ -95,15 +95,15 @@ object ThemeColors {
     )
 
     val Crimson = ThemeColorPalette(
-        secondary = Color(0xFFE50914),
-        secondaryVariant = Color(0xFFFF8C00),
-        accentGradient = listOf(Color(0xFFE50914), Color(0xFFFF5500), Color(0xFFFFB800)),
-        nativeAccentHex = "#E50914",
-        focusRing = Color(0xFFFF6B00),
-        focusBackground = Color(0xFF3D1A1A),
-        background = Color(0xFF0B0A0E),
-        backgroundElevated = Color(0xFF16131C),
-        backgroundCard = Color(0xFF211B28),
+        secondary = Color(0xFF2563EB),
+        secondaryVariant = Color(0xFF1D4ED8),
+        accentGradient = listOf(Color(0xFF172554), Color(0xFF1D4ED8), Color(0xFF2563EB), Color(0xFF3B82F6)),
+        nativeAccentHex = "#2563EB",
+        focusRing = Color(0xFF60A5FA),
+        focusBackground = Color(0xFF13203B),
+        background = Color(0xFF06080E),
+        backgroundElevated = Color(0xFF0C111D),
+        backgroundCard = Color(0xFF131B2E),
     )
 
     val Ocean = ThemeColorPalette(

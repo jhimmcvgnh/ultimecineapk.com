@@ -53,8 +53,8 @@ private fun buildColorScheme(palette: ThemeColorPalette, amoled: Boolean = false
     surface = palette.backgroundElevated,
     onSurface = Color(0xFFF5F7F8),
     surfaceVariant = palette.backgroundCard,
-    onSurfaceVariant = Color(0xFF969CA3),
-    outline = Color(0xFF252A2A),
+    onSurfaceVariant = Color(0xFF94A3B8),
+    outline = Color(0xFF1E293B),
     error = Color(0xFFE36A8A),
     onError = Color(0xFFFCE5EC),
 )
