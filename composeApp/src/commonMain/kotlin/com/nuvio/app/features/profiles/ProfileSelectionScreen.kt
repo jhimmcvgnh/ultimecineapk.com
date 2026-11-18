@@ -83,6 +83,8 @@ fun ProfileSelectionScreen(
     val profileState by ProfileRepository.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     var pinDialogProfile by remember { mutableStateOf<NuvioProfile?>(null) }
+    var editPinDialogProfile by remember { mutableStateOf<NuvioProfile?>(null) }
+    var forgotPinProfile by remember { mutableStateOf<NuvioProfile?>(null) }
     var isEditMode by remember { mutableStateOf(false) }
 
     val titleAlpha = remember { Animatable(0f) }
@@ -94,7 +96,13 @@ fun ProfileSelectionScreen(
                 profile = profile,
                 isEditMode = isEditMode,
                 activeProfileIndex = activeProfileIndex,
-                onEditProfile = onEditProfile,
+                onEditProfile = { target ->
+                    if (target.pinEnabled) {
+                        editPinDialogProfile = target
+                    } else {
+                        onEditProfile(target)
+                    }
+                },
                 onActiveProfileSelected = { scope.launch { showAlreadyActiveProfileToast(it) } },
                 onPinRequired = { pinDialogProfile = it },
                 onProfileSelected = onProfileSelected,
@@ -328,8 +336,114 @@ fun ProfileSelectionScreen(
                     onProfileSelected(profile)
                 }
             },
+            onForgotPin = {
+                pinDialogProfile = null
+                forgotPinProfile = profile
+            },
             onDismiss = { pinDialogProfile = null },
         )
+    }
+
+    editPinDialogProfile?.let { profile ->
+        PinEntryDialog(
+            profileName = profile.name,
+            onVerify = { pin -> ProfileRepository.verifyPin(profile.profileIndex, pin) },
+            onVerified = {
+                editPinDialogProfile = null
+                if (interactionEnabled) {
+                    onEditProfile(profile)
+                }
+            },
+            onForgotPin = {
+                editPinDialogProfile = null
+                forgotPinProfile = profile
+            },
+            onDismiss = { editPinDialogProfile = null },
+        )
+    }
+
+    forgotPinProfile?.let { profile ->
+        ForgotProfilePinDialog(
+            profile = profile,
+            onUnlocked = {
+                forgotPinProfile = null
+                if (interactionEnabled) {
+                    if (isEditMode) {
+                        onEditProfile(profile.copy(pinEnabled = false))
+                    } else if (profile.profileIndex != activeProfileIndex) {
+                        onProfileSelected(profile.copy(pinEnabled = false))
+                    }
+                }
+            },
+            onDismiss = { forgotPinProfile = null },
+        )
+    }
+}
+
+@Composable
+private fun ForgotProfilePinDialog(
+    profile: NuvioProfile,
+    onUnlocked: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var accountPassword by remember { mutableStateOf("") }
+    var errorText by remember { mutableStateOf<String?>(null) }
+    var isSubmitting by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    com.nuvio.app.core.ui.DialogSurface(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                text = "Recuperar Perfil (${profile.name})",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+            Text(
+                text = "Digite a senha da sua Conta Principal (Host) para remover a senha deste perfil privado:",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            com.nuvio.app.core.ui.NuvioInputField(
+                value = accountPassword,
+                onValueChange = {
+                    accountPassword = it
+                    errorText = null
+                },
+                placeholder = "Senha da Conta Host",
+            )
+            errorText?.let { err ->
+                Text(
+                    text = err,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            com.nuvio.app.core.ui.NuvioPrimaryButton(
+                text = if (isSubmitting) "Verificando..." else "Remover Senha do Perfil",
+                enabled = accountPassword.length >= 6 && !isSubmitting,
+                onClick = {
+                    isSubmitting = true
+                    errorText = null
+                    scope.launch {
+                        val ok = ProfileRepository.clearPinWithPassword(profile.profileIndex, accountPassword)
+                        isSubmitting = false
+                        if (ok) {
+                            onUnlocked()
+                        } else {
+                            errorText = "Senha da conta incorreta. Tente novamente."
+                        }
+                    }
+                },
+            )
+        }
     }
 }
 
@@ -494,21 +608,44 @@ private fun ProfileAvatarCard(
             overflow = TextOverflow.Ellipsis,
         )
 
-        if (profile.profileIndex == 1) {
+        if (profile.profileIndex == 1 || profile.pinEnabled) {
             Spacer(modifier = Modifier.height(4.dp))
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
-                    .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
-                    .padding(horizontal = 8.dp, vertical = 2.dp),
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = "HOST",
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold,
-                )
+                if (profile.profileIndex == 1) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
+                            .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            text = "HOST",
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+                if (profile.pinEnabled) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f))
+                            .border(1.dp, MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.32f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            text = "🔒 PRIVADO",
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
             }
         }
     }

@@ -21,6 +21,8 @@ data class NuvioProfile(
     @SerialName("uses_primary_addons") val usesPrimaryAddons: Boolean = false,
     @SerialName("uses_primary_plugins") val usesPrimaryPlugins: Boolean = false,
     @SerialName("pin_enabled") val pinEnabled: Boolean = false,
+    @SerialName("pin_salt") val pinSalt: String? = null,
+    @SerialName("pin_digest") val pinDigest: String? = null,
     @SerialName("pin_locked_until") val pinLockedUntil: String? = null,
     @SerialName("created_at") val createdAt: String = "",
     @SerialName("updated_at") val updatedAt: String = "",
@@ -37,6 +39,9 @@ data class ProfilePushPayload(
     @SerialName("avatar_url") val avatarUrl: String? = null,
     @SerialName("profile_background_id") val profileBackgroundId: String? = null,
     @SerialName("profile_background_url") val profileBackgroundUrl: String? = null,
+    @SerialName("pin_enabled") val pinEnabled: Boolean? = null,
+    @SerialName("pin_salt") val pinSalt: String? = null,
+    @SerialName("pin_digest") val pinDigest: String? = null,
 )
 
 @Serializable

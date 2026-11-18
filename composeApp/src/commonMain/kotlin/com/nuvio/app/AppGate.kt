@@ -233,6 +233,10 @@ internal fun AppGate(
             val profile = ProfileRepository.state.value.profiles
                 .firstOrNull { it.profileIndex == profileIndex }
                 ?: return@collect
+            if (profile.pinEnabled) {
+                appGateController.requestProfileSelection()
+                return@collect
+            }
             autoSkipProfileSelection = false
             profileSelectionLoading = true
             profileSelectionTransitionActive = true

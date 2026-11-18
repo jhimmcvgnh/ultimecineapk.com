@@ -317,9 +317,17 @@ object ProfileRepository {
         avatarId: String? = null,
         avatarUrl: String? = null,
         usesPrimaryAddons: Boolean = false,
+        pin: String? = null,
     ) {
         val existing = _state.value.profiles
         val nextIndex = ((1..MAX_PROFILES).toSet() - existing.map { it.profileIndex }.toSet()).minOrNull() ?: return
+        val cleanPin = pin?.trim()?.takeIf { it.length == 4 && it.all(Char::isDigit) }
+        val newSalt = if (cleanPin != null) generateProfilePinSalt() else null
+        val newDigest = if (cleanPin != null && newSalt != null) {
+            hashProfilePin(profileIndex = nextIndex, salt = newSalt, pin = cleanPin)
+        } else {
+            null
+        }
 
         val allPayloads = existing.map { profile ->
             ProfilePushPayload(
@@ -332,6 +340,9 @@ object ProfileRepository {
                 avatarUrl = profile.avatarUrl,
                 profileBackgroundId = profile.profileBackgroundId,
                 profileBackgroundUrl = profile.profileBackgroundUrl,
+                pinEnabled = profile.pinEnabled,
+                pinSalt = profile.pinSalt,
+                pinDigest = profile.pinDigest,
             )
         } + ProfilePushPayload(
             profileIndex = nextIndex,
@@ -340,9 +351,15 @@ object ProfileRepository {
             usesPrimaryAddons = usesPrimaryAddons,
             avatarId = avatarId,
             avatarUrl = avatarUrl,
+            pinEnabled = cleanPin != null,
+            pinSalt = newSalt,
+            pinDigest = newDigest,
         )
 
         pushProfiles(allPayloads)
+        if (cleanPin != null) {
+            rememberVerifiedPin(profileIndex = nextIndex, pin = cleanPin, fixedSalt = newSalt, fixedDigest = newDigest)
+        }
     }
 
     suspend fun updateProfile(
@@ -366,6 +383,9 @@ object ProfileRepository {
                     avatarUrl = avatarUrl,
                     profileBackgroundId = profileBackgroundId,
                     profileBackgroundUrl = profileBackgroundUrl,
+                    pinEnabled = profile.pinEnabled,
+                    pinSalt = profile.pinSalt,
+                    pinDigest = profile.pinDigest,
                 )
             } else {
                 ProfilePushPayload(
@@ -378,6 +398,9 @@ object ProfileRepository {
                     avatarUrl = profile.avatarUrl,
                     profileBackgroundId = profile.profileBackgroundId,
                     profileBackgroundUrl = profile.profileBackgroundUrl,
+                    pinEnabled = profile.pinEnabled,
+                    pinSalt = profile.pinSalt,
+                    pinDigest = profile.pinDigest,
                 )
             }
         }
@@ -450,14 +473,20 @@ object ProfileRepository {
                 val check = verifyPinLocally(profileIndex, currentPin)
                 if (!check.unlocked) return check
             }
+            val salt = generateProfilePinSalt()
+            val digest = hashProfilePin(profileIndex = profileIndex, salt = salt, pin = pin)
             val updated = _state.value.profiles.map { p ->
-                if (p.profileIndex == profileIndex) p.copy(pinEnabled = true) else p
+                if (p.profileIndex == profileIndex) {
+                    p.copy(pinEnabled = true, pinSalt = salt, pinDigest = digest)
+                } else {
+                    p
+                }
             }
             _state.value = _state.value.copy(
                 profiles = updated,
                 activeProfile = updated.find { it.profileIndex == activeProfileIndex } ?: updated.firstOrNull(),
             )
-            rememberVerifiedPin(profileIndex = profileIndex, pin = pin)
+            rememberVerifiedPin(profileIndex = profileIndex, pin = pin, fixedSalt = salt, fixedDigest = digest)
             persist()
             saveCloudMetadataProfiles(updated)
             return PinVerifyResult(unlocked = true)
@@ -490,7 +519,11 @@ object ProfileRepository {
                 if (!check.unlocked) return check
             }
             val updated = _state.value.profiles.map { p ->
-                if (p.profileIndex == profileIndex) p.copy(pinEnabled = false) else p
+                if (p.profileIndex == profileIndex) {
+                    p.copy(pinEnabled = false, pinSalt = null, pinDigest = null)
+                } else {
+                    p
+                }
             }
             _state.value = _state.value.copy(
                 profiles = updated,
@@ -518,16 +551,17 @@ object ProfileRepository {
         }
     }
 
-    suspend fun clearPinWithPassword(profileIndex: Int, accountPassword: String) {
+    suspend fun clearPinWithPassword(profileIndex: Int, accountPassword: String): Boolean {
         if (!ServerConfigurationRepository.active.value.isCustom) {
-            val email = (AuthRepository.state.value as? AuthState.Authenticated)?.email ?: return
+            val email = (AuthRepository.state.value as? AuthState.Authenticated)?.email ?: return false
             val check = CineAuthClient.login(email, accountPassword)
             if (check.isSuccess) {
                 clearPin(profileIndex, currentPin = null)
+                return true
             }
-            return
+            return false
         }
-        runCatching {
+        return runCatching {
             val params = buildJsonObject {
                 put("p_account_password", accountPassword)
                 put("p_profile_id", profileIndex)
@@ -535,9 +569,10 @@ object ProfileRepository {
             SupabaseProvider.client.postgrest.rpc("clear_profile_pin_with_account_password", params)
             pullProfiles()
             ProfilePinCacheStorage.removePayload(profileIndex)
+            true
         }.onFailure { e ->
             log.e(e) { "Failed to clear pin with password" }
-        }
+        }.getOrDefault(false)
     }
 
     suspend fun pullProfileLocks(): List<ProfileLockState> {
@@ -577,7 +612,9 @@ object ProfileRepository {
                 profileBackgroundUrl = p.profileBackgroundUrl,
                 usesPrimaryAddons = p.usesPrimaryAddons,
                 usesPrimaryPlugins = p.usesPrimaryPlugins,
-                pinEnabled = prev?.pinEnabled ?: false,
+                pinEnabled = p.pinEnabled ?: prev?.pinEnabled ?: false,
+                pinSalt = p.pinSalt ?: prev?.pinSalt,
+                pinDigest = p.pinDigest ?: prev?.pinDigest,
                 pinLockedUntil = prev?.pinLockedUntil,
             )
         }.sortedBy { it.profileIndex }
@@ -616,12 +653,18 @@ object ProfileRepository {
         syncPinCache(profiles)
     }
 
-    private fun rememberVerifiedPin(profileIndex: Int, pin: String) {
+    private fun rememberVerifiedPin(
+        profileIndex: Int,
+        pin: String,
+        fixedSalt: String? = null,
+        fixedDigest: String? = null,
+    ) {
         val profile = _state.value.profiles.find { it.profileIndex == profileIndex }
-        val salt = generateProfilePinSalt()
+        val salt = fixedSalt ?: profile?.pinSalt ?: generateProfilePinSalt()
+        val digest = fixedDigest ?: hashProfilePin(profileIndex = profileIndex, salt = salt, pin = pin)
         val payload = CachedProfilePinPayload(
             salt = salt,
-            digest = hashProfilePin(profileIndex = profileIndex, salt = salt, pin = pin),
+            digest = digest,
             profileUpdatedAt = profile?.updatedAt.orEmpty(),
         )
         ProfilePinCacheStorage.savePayload(profileIndex, json.encodeToString(payload))
@@ -631,6 +674,18 @@ object ProfileRepository {
         val profile = _state.value.profiles.find { it.profileIndex == profileIndex }
         if (profile?.pinEnabled != true) {
             return PinVerifyResult(unlocked = true)
+        }
+
+        val cloudSalt = profile.pinSalt?.takeIf { it.isNotBlank() }
+        val cloudDigest = profile.pinDigest?.takeIf { it.isNotBlank() }
+        if (cloudSalt != null && cloudDigest != null) {
+            val computed = hashProfilePin(profileIndex = profileIndex, salt = cloudSalt, pin = pin)
+            return if (computed == cloudDigest) {
+                rememberVerifiedPin(profileIndex = profileIndex, pin = pin, fixedSalt = cloudSalt, fixedDigest = cloudDigest)
+                PinVerifyResult(unlocked = true)
+            } else {
+                PinVerifyResult(unlocked = false, message = localizedString(Res.string.pin_incorrect))
+            }
         }
 
         val payload = ProfilePinCacheStorage.loadPayload(profileIndex).orEmpty().trim()
@@ -674,6 +729,16 @@ object ProfileRepository {
             val profile = profilesByIndex[profileIndex]
             if (profile == null || !profile.pinEnabled) {
                 ProfilePinCacheStorage.removePayload(profileIndex)
+                continue
+            }
+
+            if (!profile.pinSalt.isNullOrBlank() && !profile.pinDigest.isNullOrBlank()) {
+                val payload = CachedProfilePinPayload(
+                    salt = profile.pinSalt,
+                    digest = profile.pinDigest,
+                    profileUpdatedAt = profile.updatedAt,
+                )
+                ProfilePinCacheStorage.savePayload(profileIndex, json.encodeToString(payload))
                 continue
             }
 

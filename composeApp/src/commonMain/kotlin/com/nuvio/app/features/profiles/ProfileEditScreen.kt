@@ -82,6 +82,9 @@ fun ProfileEditScreen(
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var showPinSetup by remember { mutableStateOf(false) }
     var showPinClear by remember { mutableStateOf(false) }
+    var enablePinOnCreate by rememberSaveable { mutableStateOf(false) }
+    var newProfilePin by rememberSaveable { mutableStateOf("") }
+    var showCreatePinPicker by remember { mutableStateOf(false) }
     val memberAccess by remember {
         MemberAccessRepository.ensureStarted()
         MemberAccessRepository.access
@@ -234,32 +237,86 @@ fun ProfileEditScreen(
             }
         }
 
-        if (!isNew) {
-            item {
-                NuvioSurfaceCard {
-                    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                        Text(
-                            text = stringResource(Res.string.profile_security),
-                            style = MaterialTheme.typography.titleLarge,
-                            color = MaterialTheme.colorScheme.onSurface,
+        item {
+            NuvioSurfaceCard {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Text(
+                        text = "🔒 Perfil Privado (Senha de Acesso)",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (isNew) {
+                        ProfileOptionRow(
+                            title = "Proteger perfil com senha (PIN de 4 dígitos)",
+                            description = "Como na Netflix: exige senha de 4 números para entrar ou editar este perfil privado.",
+                            checked = enablePinOnCreate,
+                            onCheckedChange = { enabled ->
+                                enablePinOnCreate = enabled
+                                if (enabled && newProfilePin.length != 4) {
+                                    showCreatePinPicker = true
+                                } else if (!enabled) {
+                                    newProfilePin = ""
+                                }
+                            },
                         )
+                        if (enablePinOnCreate) {
+                            Text(
+                                text = if (newProfilePin.length == 4) {
+                                    "✓ Senha de 4 dígitos configurada (••••). Este perfil será criado como Privado."
+                                } else {
+                                    "Escolha uma senha de 4 números para proteger este perfil:"
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (newProfilePin.length == 4) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                fontWeight = FontWeight.Medium,
+                            )
+                            NuvioPrimaryButton(
+                                text = if (newProfilePin.length == 4) {
+                                    "Alterar Senha de 4 Dígitos (••••)"
+                                } else {
+                                    "Definir Senha de 4 Dígitos"
+                                },
+                                onClick = { showCreatePinPicker = true },
+                            )
+                        }
+                    } else {
                         Text(
                             text = if (currentProfile?.pinEnabled == true) {
-                                stringResource(Res.string.profile_security_pin_enabled)
+                                "🔒 Perfil Privado Ativo — protegido por senha de 4 dígitos. Somente quem souber a senha pode entrar neste perfil."
                             } else {
-                                stringResource(Res.string.profile_security_pin_disabled)
+                                "🔓 Perfil Público — coloque uma senha de 4 dígitos (como na Netflix) para tornar este perfil privado."
                             },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         if (currentProfile?.pinEnabled == true) {
                             NuvioPrimaryButton(
-                                text = stringResource(Res.string.profile_remove_pin_lock),
-                                onClick = { showPinClear = true },
+                                text = "Alterar Senha do Perfil",
+                                onClick = { showPinSetup = true },
                             )
+                            Button(
+                                onClick = { showPinClear = true },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    contentColor = MaterialTheme.colorScheme.onSurface,
+                                ),
+                            ) {
+                                Text(
+                                    text = stringResource(Res.string.profile_remove_pin_lock),
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                            }
                         } else {
                             NuvioPrimaryButton(
-                                text = stringResource(Res.string.profile_set_pin_lock),
+                                text = "🔒 Colocar Senha no Perfil (Tornar Privado)",
                                 onClick = { showPinSetup = true },
                             )
                         }
@@ -278,7 +335,10 @@ fun ProfileEditScreen(
                 } else {
                     stringResource(Res.string.collections_editor_save_changes)
                 },
-                enabled = name.isNotBlank() && !avatarUrlIsInvalid && !isSaving,
+                enabled = name.isNotBlank() &&
+                    !avatarUrlIsInvalid &&
+                    !isSaving &&
+                    (!isNew || !enablePinOnCreate || newProfilePin.length == 4),
                 onClick = {
                     isSaving = true
                     scope.launch {
@@ -290,6 +350,7 @@ fun ProfileEditScreen(
                                 avatarId = if (customAvatarUrl == null) selectedAvatarId else null,
                                 avatarUrl = customAvatarUrl,
                                 usesPrimaryAddons = usesPrimaryAddons,
+                                pin = newProfilePin.takeIf { enablePinOnCreate && it.length == 4 },
                             )
                         } else {
                             ProfileRepository.updateProfile(
@@ -353,6 +414,30 @@ fun ProfileEditScreen(
         },
         onDismiss = { showDeleteConfirm = false },
     )
+
+    if (showCreatePinPicker && isNew) {
+        PinEntryDialog(
+            profileName = stringResource(Res.string.profile_enter_new_pin),
+            onVerify = { pin ->
+                if (pin.length == 4 && pin.all(Char::isDigit)) {
+                    PinVerifyResult(unlocked = true)
+                } else {
+                    PinVerifyResult(unlocked = false, message = "Escolha 4 números.")
+                }
+            },
+            onVerified = { pin ->
+                newProfilePin = pin
+                enablePinOnCreate = true
+                showCreatePinPicker = false
+            },
+            onDismiss = {
+                showCreatePinPicker = false
+                if (newProfilePin.length != 4) {
+                    enablePinOnCreate = false
+                }
+            },
+        )
+    }
 
     if (showPinSetup && currentProfile != null) {
         PinSetupDialog(
