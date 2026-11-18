@@ -31,32 +31,95 @@ object AuthRepository {
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
+    private val _deviceTrialLock = MutableStateFlow<PersistedDeviceTrialLock?>(null)
+    internal val deviceTrialLock: StateFlow<PersistedDeviceTrialLock?> = _deviceTrialLock.asStateFlow()
+
     private var initialized = false
     private var explicitSignOutRequested = false
     private var sessionStatusJob: Job? = null
     private var validatedRemoteUserId: String? = null
+
+    private fun currentTimeMillis(): Long =
+        kotlin.time.Clock.System.now().toEpochMilliseconds()
+
+    internal fun refreshDeviceTrialLock(): PersistedDeviceTrialLock? {
+        val loaded = CineSessionPersistence.loadDeviceTrialLock() ?: run {
+            _deviceTrialLock.value = null
+            return null
+        }
+        val expiresAt = loaded.trialExpiresAtEpochMs
+        val now = currentTimeMillis()
+        val updated = if (!loaded.isPaidUpgraded && expiresAt != null && expiresAt > 0L) {
+            val remainingMs = expiresAt - now
+            if (remainingMs <= 0L) {
+                loaded.copy(isTrialExpired = true, trialDaysRemaining = 0)
+            } else {
+                val days = ((remainingMs + 86_400_000L - 1L) / 86_400_000L).toInt().coerceAtLeast(1)
+                loaded.copy(isTrialExpired = false, trialDaysRemaining = days)
+            }
+        } else {
+            loaded
+        }
+        if (updated != loaded) {
+            CineSessionPersistence.saveDeviceTrialLock(updated)
+        }
+        _deviceTrialLock.value = updated
+        return updated
+    }
+
+    internal suspend fun syncDeviceTrialFromServer(): PersistedDeviceTrialLock? {
+        CineAuthClient.checkDeviceTrialStatus()
+        return refreshDeviceTrialLock()
+    }
 
     fun initialize() {
         if (initialized) return
         initialized = true
 
         AuthStorage.clearAnonymousUserId()
+        refreshDeviceTrialLock()
         val initialHostSession = CineSessionPersistence.loadHostSession()
         val initialSupaSession = runCatching { SupabaseProvider.client.auth.currentSessionOrNull() }.getOrNull()
         if (initialHostSession != null) {
-            _state.value = AuthState.Authenticated(
-                userId = initialHostSession.userId,
-                email = initialHostSession.email,
-                isAnonymous = false,
-            )
-            scope.launch {
-                val restoredOk = validateRemoteSession(initialHostSession.userId, initialHostSession.email)
-                if (restoredOk) {
-                    refreshAccessToken()
+            val expiresAt = initialHostSession.trialExpiresAtEpochMs
+            if (initialHostSession.isTrial && expiresAt != null && expiresAt > 0L && currentTimeMillis() >= expiresAt) {
+                CineSessionPersistence.saveDeviceTrialLock(
+                    PersistedDeviceTrialLock(
+                        boundTrialEmail = initialHostSession.email,
+                        isTrialExpired = true,
+                        trialExpiresAtEpochMs = expiresAt,
+                        trialDaysRemaining = 0,
+                        isPaidUpgraded = false,
+                    ),
+                )
+                refreshDeviceTrialLock()
+                _state.value = AuthState.Unauthenticated
+                scope.launch {
+                    clearLocalSessionAfterRemoteInvalidation()
+                    _error.value = "Seu teste grátis de 20 dias terminou! Para voltar a assistir, realize o pagamento de ${CineAuthClient.currentFormattedPrice()} no site oficial usando obrigatoriamente o Gmail ${initialHostSession.email}."
+                }
+            } else {
+                _state.value = AuthState.Authenticated(
+                    userId = initialHostSession.userId,
+                    email = initialHostSession.email,
+                    isAnonymous = false,
+                )
+                scope.launch {
+                    val restoredOk = validateRemoteSession(
+                        userId = initialHostSession.userId,
+                        email = initialHostSession.email,
+                        forceEntitlementCheck = initialHostSession.isTrial,
+                    )
+                    if (restoredOk) {
+                        refreshAccessToken()
+                    }
                 }
             }
         } else if (initialSupaSession == null) {
             _state.value = AuthState.Unauthenticated
+            scope.launch {
+                syncDeviceTrialFromServer()
+            }
         }
 
         sessionStatusJob = scope.launch {
@@ -68,15 +131,19 @@ object AuthRepository {
                         val userId = user?.id?.takeIf { it.isNotBlank() } ?: saved?.userId.orEmpty()
                         val email = user?.email?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
                             ?: saved?.email.orEmpty()
-                        if (!validateRemoteSession(userId, email)) return@collect
+                        if (!validateRemoteSession(userId, email, forceEntitlementCheck = saved?.isTrial == true)) return@collect
+                        val latestSaved = CineSessionPersistence.loadHostSession()
                         explicitSignOutRequested = false
                         CineSessionPersistence.saveHostSession(
                             SavedHostSession(
                                 userId = userId,
                                 email = email,
-                                accessToken = status.session.accessToken.ifBlank { saved?.accessToken.orEmpty() },
-                                refreshToken = status.session.refreshToken.ifBlank { saved?.refreshToken.orEmpty() },
+                                accessToken = status.session.accessToken.ifBlank { latestSaved?.accessToken ?: saved?.accessToken.orEmpty() },
+                                refreshToken = status.session.refreshToken.ifBlank { latestSaved?.refreshToken ?: saved?.refreshToken.orEmpty() },
                                 paidVerified = true,
+                                isTrial = latestSaved?.isTrial ?: saved?.isTrial ?: false,
+                                trialExpiresAtEpochMs = latestSaved?.trialExpiresAtEpochMs ?: saved?.trialExpiresAtEpochMs,
+                                trialDaysRemaining = latestSaved?.trialDaysRemaining ?: saved?.trialDaysRemaining ?: 0,
                             ),
                         )
                         _state.value = AuthState.Authenticated(
@@ -142,6 +209,9 @@ object AuthRepository {
                         accessToken = supaSession.accessToken,
                         refreshToken = supaSession.refreshToken.ifBlank { saved?.refreshToken.orEmpty() },
                         paidVerified = true,
+                        isTrial = saved?.isTrial ?: false,
+                        trialExpiresAtEpochMs = saved?.trialExpiresAtEpochMs,
+                        trialDaysRemaining = saved?.trialDaysRemaining ?: 0,
                     ),
                 )
             }
@@ -159,12 +229,53 @@ object AuthRepository {
         return refreshed.access_token
     }
 
-    private suspend fun validateRemoteSession(userId: String, email: String): Boolean {
+    internal suspend fun revalidateActiveEntitlement(): Boolean {
+        val saved = CineSessionPersistence.loadHostSession() ?: return false
+        val expiresAt = saved.trialExpiresAtEpochMs
+        if (saved.isTrial && expiresAt != null && expiresAt > 0L && currentTimeMillis() >= expiresAt) {
+            CineSessionPersistence.saveDeviceTrialLock(
+                PersistedDeviceTrialLock(
+                    boundTrialEmail = saved.email,
+                    isTrialExpired = true,
+                    trialExpiresAtEpochMs = expiresAt,
+                    trialDaysRemaining = 0,
+                    isPaidUpgraded = false,
+                ),
+            )
+            refreshDeviceTrialLock()
+            clearLocalSessionAfterRemoteInvalidation()
+            _error.value = "Seu teste grátis de 20 dias terminou! Para voltar a assistir, realize o pagamento único de ${CineAuthClient.currentFormattedPrice()} no site oficial usando obrigatoriamente o Gmail ${saved.email}."
+            return false
+        }
+        return validateRemoteSession(
+            userId = saved.userId,
+            email = saved.email,
+            forceEntitlementCheck = true,
+        )
+    }
+
+    private suspend fun validateRemoteSession(
+        userId: String,
+        email: String,
+        forceEntitlementCheck: Boolean = false,
+    ): Boolean {
         if (userId.isBlank() || email.isBlank()) {
             clearLocalSessionAfterRemoteInvalidation()
             return false
         }
-        if (validatedRemoteUserId == userId) return true
+        if (!forceEntitlementCheck && validatedRemoteUserId == userId) return true
+
+        val saved = CineSessionPersistence.loadHostSession()
+        val localExpiresAt = saved?.trialExpiresAtEpochMs
+        if (saved?.isTrial == true && localExpiresAt != null && localExpiresAt > 0L && currentTimeMillis() >= localExpiresAt) {
+            val check = CineAuthClient.checkEmail(email).getOrNull()
+            refreshDeviceTrialLock()
+            if (check == null || !check.entitlementActive) {
+                clearLocalSessionAfterRemoteInvalidation()
+                _error.value = "Seu teste grátis de 20 dias para $email encerrou! Para voltar a assistir, realize o pagamento único de ${CineAuthClient.currentFormattedPrice()} no site oficial usando obrigatoriamente o Gmail $email."
+                return false
+            }
+        }
 
         if (SupabaseProvider.client.auth.currentSessionOrNull() != null) {
             val sessionValid = runCatching {
@@ -184,13 +295,28 @@ object AuthRepository {
         }
 
         val entitlementCheck = CineAuthClient.checkEmail(email)
+        refreshDeviceTrialLock()
         if (entitlementCheck.isSuccess) {
             val info = entitlementCheck.getOrThrow()
             if (!info.entitlementActive) {
-                log.w { "Account $email does not have an active PIX entitlement; clearing session" }
+                log.w { "Account $email does not have an active entitlement; clearing session" }
                 clearLocalSessionAfterRemoteInvalidation()
-                _error.value = "Acesso negado: Este Gmail ($email) não possui pagamento aprovado de ${CineAuthClient.currentFormattedPrice()}."
+                refreshDeviceTrialLock()
+                _error.value = if (info.isTrialExpired) {
+                    "Seu teste grátis de 20 dias para $email encerrou! Para voltar a assistir e consumir conteúdos, realize o pagamento único de ${CineAuthClient.currentFormattedPrice()} no site oficial usando obrigatoriamente o mesmo Gmail ($email)."
+                } else {
+                    "Acesso negado: Este Gmail ($email) não possui pagamento aprovado de ${CineAuthClient.currentFormattedPrice()}."
+                }
                 return false
+            }
+            if (saved != null && saved.email.equals(email, ignoreCase = true)) {
+                CineSessionPersistence.saveHostSession(
+                    saved.copy(
+                        isTrial = info.isTrial && !info.isPaid,
+                        trialExpiresAtEpochMs = info.trialExpiresAtMs,
+                        trialDaysRemaining = info.trialDaysRemaining,
+                    ),
+                )
             }
             validatedRemoteUserId = userId
         }
@@ -236,8 +362,12 @@ object AuthRepository {
                 accessToken = accessToken,
                 refreshToken = refreshToken,
                 paidVerified = true,
+                isTrial = backend.user.isTrial,
+                trialExpiresAtEpochMs = backend.user.trialExpiresAtMs,
+                trialDaysRemaining = backend.user.trialDaysRemaining,
             ),
         )
+        refreshDeviceTrialLock()
         CineSessionPersistence.clearPaymentState()
         if (isSignUp) {
             CineSessionPersistence.markAccountJustCreated(userId)
@@ -254,16 +384,25 @@ object AuthRepository {
         _error.value = e.message ?: "Não foi possível iniciar sessão. Tente fazer login."
     }
 
-    suspend fun signUpWithEmail(email: String, password: String): Result<Unit> {
+    suspend fun signUpWithEmail(
+        email: String,
+        password: String,
+        isTrial: Boolean = false,
+    ): Result<Unit> {
         _error.value = null
         explicitSignOutRequested = false
         AuthStorage.clearAnonymousUserId()
         val normalizedEmail = email.trim().lowercase()
 
-        val backendResult = CineAuthClient.register(normalizedEmail, password)
+        val backendResult = CineAuthClient.register(normalizedEmail, password, isTrial = isTrial)
+        refreshDeviceTrialLock()
         if (backendResult.isFailure) {
             val ex = backendResult.exceptionOrNull()
-            val msg = ex?.message ?: "Acesso negado: O Gmail $normalizedEmail não possui pagamento PIX de ${CineAuthClient.currentFormattedPrice()} aprovado."
+            val msg = ex?.message ?: if (isTrial) {
+                "Não foi possível ativar o teste grátis de 20 dias neste dispositivo."
+            } else {
+                "Acesso negado: O Gmail $normalizedEmail não possui pagamento PIX de ${CineAuthClient.currentFormattedPrice()} aprovado."
+            }
             _error.value = msg
             return Result.failure(ex ?: Exception(msg))
         }
@@ -283,6 +422,7 @@ object AuthRepository {
         val normalizedEmail = email.trim().lowercase()
 
         val backendResult = CineAuthClient.login(normalizedEmail, password)
+        refreshDeviceTrialLock()
         if (backendResult.isFailure) {
             val ex = backendResult.exceptionOrNull()
             val msg = ex?.message ?: "Gmail ou senha incorretos ou pagamento não encontrado."

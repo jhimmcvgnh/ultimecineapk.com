@@ -36,6 +36,13 @@ internal data class CheckEmailResult(
     val email: String,
     val entitlementActive: Boolean,
     val hasAccount: Boolean,
+    val isPaid: Boolean = false,
+    val isTrial: Boolean = false,
+    val isTrialExpired: Boolean = false,
+    val trialExpiresAt: String? = null,
+    val trialExpiresAtMs: Long? = null,
+    val trialDaysRemaining: Int = 0,
+    val boundTrialEmail: String? = null,
 )
 
 internal data class SessionStatusResult(
@@ -51,6 +58,10 @@ internal data class CineAuthUser(
     val email: String,
     val name: String,
     val subscriptionActive: Boolean,
+    val isTrial: Boolean = false,
+    val trialExpiresAt: String? = null,
+    val trialExpiresAtMs: Long? = null,
+    val trialDaysRemaining: Int = 0,
 )
 
 internal data class CineAuthSuccess(
@@ -77,6 +88,8 @@ internal data class SupabaseAuthUserDto(
 internal class CineAuthException(
     val code: String?,
     override val message: String,
+    val boundTrialEmail: String? = null,
+    val isTrialExpired: Boolean = false,
 ) : Exception(message)
 
 @Serializable
@@ -84,7 +97,14 @@ private data class CheckEmailApiResponse(
     val ok: Boolean = false,
     val email: String = "",
     val entitlementActive: Boolean = false,
+    val isPaid: Boolean = false,
+    val isTrial: Boolean = false,
+    val isTrialExpired: Boolean = false,
+    val trialExpiresAt: String? = null,
+    val trialExpiresAtMs: Long? = null,
+    val trialDaysRemaining: Int = 0,
     val hasAccount: Boolean = false,
+    val boundTrialEmail: String? = null,
     val error: String? = null,
 )
 
@@ -117,6 +137,10 @@ private data class AuthUserDto(
     val email: String = "",
     val name: String = "",
     val subscriptionActive: Boolean = false,
+    val isTrial: Boolean = false,
+    val trialExpiresAt: String? = null,
+    val trialExpiresAtMs: Long? = null,
+    val trialDaysRemaining: Int = 0,
 )
 
 @Serializable
@@ -126,6 +150,8 @@ private data class AuthApiResponse(
     val error: String? = null,
     val token: String? = null,
     val refreshToken: String? = null,
+    val boundTrialEmail: String? = null,
+    val isTrialExpired: Boolean = false,
     val user: AuthUserDto? = null,
 )
 
@@ -166,9 +192,11 @@ internal object CineAuthClient {
 
     suspend fun checkEmail(email: String, paymentId: String? = null): Result<CheckEmailResult> = runCatching {
         val normalized = email.trim().lowercase()
+        val deviceId = AuthStorage.loadDeviceFingerprint()
         val payload = buildJsonObject {
             put("email", normalized)
             paymentId?.trim()?.takeIf { it.isNotBlank() }?.let { put("paymentId", it) }
+            if (deviceId.isNotBlank()) put("deviceId", deviceId)
         }.toString()
 
         val response = http.post("${CineBackendConfig.baseUrl}/api/auth/check-email") {
@@ -186,10 +214,80 @@ internal object CineAuthClient {
         if (response.status.value !in 200..299 || !parsed.ok) {
             throw CineAuthException(null, parsed.error ?: "Falha ao verificar pagamento do Gmail.")
         }
+        val resolvedEmail = parsed.email.ifBlank { normalized }
+        val boundEmail = parsed.boundTrialEmail?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+            ?: resolvedEmail.takeIf { parsed.isTrial || parsed.isTrialExpired }
+        if (boundEmail != null) {
+            CineSessionPersistence.saveDeviceTrialLock(
+                PersistedDeviceTrialLock(
+                    boundTrialEmail = boundEmail,
+                    isTrialExpired = parsed.isTrialExpired && !parsed.isPaid,
+                    trialExpiresAtEpochMs = parsed.trialExpiresAtMs,
+                    trialDaysRemaining = parsed.trialDaysRemaining,
+                    isPaidUpgraded = parsed.isPaid && boundEmail == resolvedEmail,
+                ),
+            )
+        } else if (parsed.isPaid && resolvedEmail.isNotBlank()) {
+            CineSessionPersistence.markDeviceTrialPaid(resolvedEmail)
+        }
         CheckEmailResult(
-            email = parsed.email.ifBlank { normalized },
+            email = resolvedEmail,
             entitlementActive = parsed.entitlementActive,
             hasAccount = parsed.hasAccount,
+            isPaid = parsed.isPaid,
+            isTrial = parsed.isTrial,
+            isTrialExpired = parsed.isTrialExpired,
+            trialExpiresAt = parsed.trialExpiresAt,
+            trialExpiresAtMs = parsed.trialExpiresAtMs,
+            trialDaysRemaining = parsed.trialDaysRemaining,
+            boundTrialEmail = boundEmail,
+        )
+    }
+
+    suspend fun checkDeviceTrialStatus(): Result<CheckEmailResult?> = runCatching {
+        val deviceId = AuthStorage.loadDeviceFingerprint()
+        if (deviceId.isBlank()) return@runCatching null
+        val payload = buildJsonObject {
+            put("email", "")
+            put("deviceId", deviceId)
+        }.toString()
+        val response = http.post("${CineBackendConfig.baseUrl}/api/auth/check-email") {
+            timeout {
+                connectTimeoutMillis = 3_500
+                socketTimeoutMillis = 4_500
+                requestTimeoutMillis = 4_500
+            }
+            header("Content-Type", "application/json")
+            header("Accept", "application/json")
+            setBody(payload)
+        }
+        val rawBody = readBoundedResponseBody(response.bodyAsChannel(), response.contentLength())
+        val parsed = json.decodeFromString<CheckEmailApiResponse>(rawBody)
+        if (response.status.value !in 200..299 || !parsed.ok) return@runCatching null
+        val boundEmail = parsed.boundTrialEmail?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+            ?: parsed.email.trim().lowercase().takeIf { it.isNotBlank() }
+            ?: return@runCatching null
+
+        CineSessionPersistence.saveDeviceTrialLock(
+            PersistedDeviceTrialLock(
+                boundTrialEmail = boundEmail,
+                isTrialExpired = parsed.isTrialExpired && !parsed.isPaid,
+                trialExpiresAtEpochMs = parsed.trialExpiresAtMs,
+                trialDaysRemaining = parsed.trialDaysRemaining,
+                isPaidUpgraded = parsed.isPaid,
+            ),
+        )
+        CheckEmailResult(
+            email = boundEmail,
+            entitlementActive = parsed.entitlementActive,
+            hasAccount = parsed.hasAccount,
+            isPaid = parsed.isPaid,
+            isTrial = parsed.isTrial,
+            isTrialExpired = parsed.isTrialExpired,
+            trialExpiresAt = parsed.trialExpiresAt,
+            trialExpiresAtMs = parsed.trialExpiresAtMs,
+            trialDaysRemaining = parsed.trialDaysRemaining,
+            boundTrialEmail = boundEmail,
         )
     }
 
@@ -231,35 +329,74 @@ internal object CineAuthClient {
         defaultError: String,
     ): CineAuthSuccess {
         val parsed = json.decodeFromString<AuthApiResponse>(rawBody)
+        val boundEmail = parsed.boundTrialEmail?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+        val expiredTrial = parsed.isTrialExpired || parsed.code == "TRIAL_EXPIRED"
+        if (boundEmail != null) {
+            CineSessionPersistence.saveDeviceTrialLock(
+                PersistedDeviceTrialLock(
+                    boundTrialEmail = boundEmail,
+                    isTrialExpired = expiredTrial,
+                ),
+            )
+        }
         if (statusCode !in 200..299 || !parsed.ok || parsed.token.isNullOrBlank() || parsed.user == null) {
             throw CineAuthException(
                 code = parsed.code,
                 message = parsed.error ?: defaultError,
+                boundTrialEmail = boundEmail,
+                isTrialExpired = expiredTrial,
             )
         }
         if (!parsed.user.subscriptionActive) {
             throw CineAuthException(
-                code = "PAYMENT_REQUIRED",
-                message = "Acesso negado: Este Gmail não possui pagamento de ${currentFormattedPrice()} aprovado.",
+                code = if (expiredTrial) "TRIAL_EXPIRED" else "PAYMENT_REQUIRED",
+                message = parsed.error ?: "Acesso negado: Este Gmail não possui pagamento de ${currentFormattedPrice()} aprovado.",
+                boundTrialEmail = boundEmail,
+                isTrialExpired = expiredTrial,
             )
+        }
+        val resolvedEmail = parsed.user.email.ifBlank { fallbackEmail }.trim().lowercase()
+        if (parsed.user.isTrial) {
+            CineSessionPersistence.saveDeviceTrialLock(
+                PersistedDeviceTrialLock(
+                    boundTrialEmail = resolvedEmail,
+                    isTrialExpired = false,
+                    trialExpiresAtEpochMs = parsed.user.trialExpiresAtMs,
+                    trialDaysRemaining = parsed.user.trialDaysRemaining,
+                    isPaidUpgraded = false,
+                ),
+            )
+        } else {
+            CineSessionPersistence.markDeviceTrialPaid(resolvedEmail)
         }
         return CineAuthSuccess(
             token = parsed.token,
             refreshToken = parsed.refreshToken?.takeIf { it.isNotBlank() },
             user = CineAuthUser(
                 id = parsed.user.id,
-                email = parsed.user.email.ifBlank { fallbackEmail },
+                email = resolvedEmail,
                 name = parsed.user.name,
                 subscriptionActive = parsed.user.subscriptionActive,
+                isTrial = parsed.user.isTrial,
+                trialExpiresAt = parsed.user.trialExpiresAt,
+                trialExpiresAtMs = parsed.user.trialExpiresAtMs,
+                trialDaysRemaining = parsed.user.trialDaysRemaining,
             ),
         )
     }
 
-    suspend fun register(email: String, password: String): Result<CineAuthSuccess> = runCatching {
+    suspend fun register(
+        email: String,
+        password: String,
+        isTrial: Boolean = false,
+    ): Result<CineAuthSuccess> = runCatching {
         val normalized = email.trim().lowercase()
+        val deviceId = AuthStorage.loadDeviceFingerprint()
         val payload = buildJsonObject {
             put("email", normalized)
             put("password", password)
+            put("isTrial", isTrial)
+            if (deviceId.isNotBlank()) put("deviceId", deviceId)
         }.toString()
 
         val response = http.post("${CineBackendConfig.baseUrl}/api/auth/register") {
@@ -272,15 +409,21 @@ internal object CineAuthClient {
             rawBody = rawBody,
             statusCode = response.status.value,
             fallbackEmail = normalized,
-            defaultError = "Não foi possível criar sua conta. Verifique se o PIX foi aprovado.",
+            defaultError = if (isTrial) {
+                "Não foi possível ativar o teste grátis de 20 dias neste dispositivo."
+            } else {
+                "Não foi possível criar sua conta. Verifique se o PIX foi aprovado."
+            },
         )
     }
 
     suspend fun login(email: String, password: String): Result<CineAuthSuccess> = runCatching {
         val normalized = email.trim().lowercase()
+        val deviceId = AuthStorage.loadDeviceFingerprint()
         val payload = buildJsonObject {
             put("email", normalized)
             put("password", password)
+            if (deviceId.isNotBlank()) put("deviceId", deviceId)
         }.toString()
 
         val response = http.post("${CineBackendConfig.baseUrl}/api/auth/login") {

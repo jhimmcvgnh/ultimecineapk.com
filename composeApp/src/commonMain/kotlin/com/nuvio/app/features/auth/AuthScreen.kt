@@ -210,6 +210,7 @@ fun AuthScreen(
     modifier: Modifier = Modifier,
 ) {
     val authError by AuthRepository.error.collectAsStateWithLifecycle()
+    val deviceTrialLock by AuthRepository.deviceTrialLock.collectAsStateWithLifecycle()
     val deviceLinkAuthState by DeviceLinkAuthRepository.state.collectAsStateWithLifecycle()
     val serverConnectionState by ServerConnectionController.state.collectAsStateWithLifecycle()
     val pendingDeepLink by AppDeepLinkRepository.pendingDeepLink.collectAsStateWithLifecycle()
@@ -220,10 +221,18 @@ fun AuthScreen(
     val focusManager = LocalFocusManager.current
     val uriHandler = LocalUriHandler.current
     val initialPaymentState = remember { CineSessionPersistence.loadPaymentState() }
+    val initialTrialLock = remember { AuthRepository.refreshDeviceTrialLock() }
+
+    val lockedTrialEmail = deviceTrialLock?.boundTrialEmail
+        ?.takeIf { it.isNotBlank() && !deviceTrialLock!!.isPaidUpgraded }
+        ?: initialTrialLock?.boundTrialEmail?.takeIf { it.isNotBlank() && !initialTrialLock.isPaidUpgraded }
+    val isTrialExpired = (deviceTrialLock?.isTrialExpired == true && !deviceTrialLock!!.isPaidUpgraded) ||
+        (initialTrialLock?.isTrialExpired == true && !initialTrialLock.isPaidUpgraded)
 
     var showLoginScreen by rememberSaveable {
         mutableStateOf(!initialPaymentState?.verifiedPaidEmail.isNullOrBlank())
     }
+    var isTrialFlow by rememberSaveable { mutableStateOf(false) }
     var verifiedPaidEmail by rememberSaveable { mutableStateOf(initialPaymentState?.verifiedPaidEmail) }
     var activeCheckoutSessionId by rememberSaveable {
         mutableStateOf(
@@ -236,7 +245,9 @@ fun AuthScreen(
         mutableStateOf(initialPaymentState?.confirmedPaidHasAccount ?: false)
     }
     var confirmedPaymentId by rememberSaveable { mutableStateOf(initialPaymentState?.confirmedPaymentId) }
-    var manualCheckEmail by rememberSaveable { mutableStateOf(initialPaymentState?.confirmedPaidEmail.orEmpty()) }
+    var manualCheckEmail by rememberSaveable {
+        mutableStateOf(initialPaymentState?.confirmedPaidEmail ?: lockedTrialEmail.orEmpty())
+    }
     var showManualEmailFallback by rememberSaveable { mutableStateOf(false) }
     var isConfirmingPayment by rememberSaveable { mutableStateOf(false) }
     var localError by rememberSaveable { mutableStateOf<String?>(null) }
@@ -250,7 +261,9 @@ fun AuthScreen(
             },
         )
     }
-    var email by rememberSaveable { mutableStateOf(initialPaymentState?.verifiedPaidEmail.orEmpty()) }
+    var email by rememberSaveable {
+        mutableStateOf(initialPaymentState?.verifiedPaidEmail ?: lockedTrialEmail.orEmpty())
+    }
     var password by rememberSaveable { mutableStateOf("") }
     var passwordVisible by rememberSaveable { mutableStateOf(false) }
     var isLoading by rememberSaveable { mutableStateOf(false) }
@@ -305,9 +318,21 @@ fun AuthScreen(
         )
     }
 
+    LaunchedEffect(lockedTrialEmail) {
+        if (!lockedTrialEmail.isNullOrBlank()) {
+            if (manualCheckEmail.isBlank()) {
+                manualCheckEmail = lockedTrialEmail
+            }
+            if (verifiedPaidEmail == null && email.isBlank()) {
+                email = lockedTrialEmail
+            }
+        }
+    }
+
     LaunchedEffect(appVisibility) {
         if (appVisibility == AppVisibility.Foreground) {
             CineAuthClient.refreshPlanInfo()
+            AuthRepository.syncDeviceTrialFromServer()
         }
     }
 
@@ -420,8 +445,12 @@ fun AuthScreen(
         confirmedPaidHasAccount = false
         confirmedPaymentId = null
         verifiedPaidEmail = null
+        isTrialFlow = false
         showManualEmailFallback = false
         isConfirmingPayment = false
+        if (!lockedTrialEmail.isNullOrBlank()) {
+            manualCheckEmail = lockedTrialEmail
+        }
         syncPersistedPaymentState(
             pendingSessionId = sessionId,
             paidEmail = null,
@@ -430,7 +459,32 @@ fun AuthScreen(
             verifiedEmail = null,
             signUpMode = true,
         )
-        uriHandler.openUri("${CineBackendConfig.checkoutUrl}?session=$sessionId")
+        val checkoutUrl = buildString {
+            append("${CineBackendConfig.checkoutUrl}?session=$sessionId")
+            if (!lockedTrialEmail.isNullOrBlank()) {
+                append("&email=$lockedTrialEmail&lockEmail=1")
+            }
+        }
+        uriHandler.openUri(checkoutUrl)
+    }
+
+    fun startFreeTrial() {
+        localError = null
+        AuthRepository.clearError()
+        if (isTrialExpired && !lockedTrialEmail.isNullOrBlank()) {
+            localError = "Seu período de 20 dias do Teste Grátis ($lockedTrialEmail) já terminou! Realize o pagamento de $priceLabel no site usando obrigatoriamente o Gmail $lockedTrialEmail."
+            return
+        }
+        verifiedPaidEmail = null
+        isConfirmingPayment = false
+        isTrialFlow = true
+        if (!lockedTrialEmail.isNullOrBlank()) {
+            email = lockedTrialEmail
+            isSignUp = false
+        } else {
+            isSignUp = true
+        }
+        showLoginScreen = true
     }
 
     fun proceedIfPaymentConfirmed() {
@@ -477,7 +531,9 @@ fun AuthScreen(
                     isConfirmingPayment = false
                     if (check.isSuccess) {
                         val info = check.getOrThrow()
-                        if (info.entitlementActive) {
+                        if (!lockedTrialEmail.isNullOrBlank() && !info.email.equals(lockedTrialEmail, ignoreCase = true)) {
+                            localError = "Este aparelho utilizou o Teste Grátis com o Gmail $lockedTrialEmail. O pagamento de $priceLabel deve ser feito obrigatoriamente com $lockedTrialEmail."
+                        } else if (info.entitlementActive && (info.isPaid || !info.isTrial)) {
                             unlockWithConfirmedPayment(info.email, info.hasAccount)
                         } else {
                             localError = "Pagamento PIX de ${CineAuthClient.currentFormattedPrice()} ainda não confirmado para ${info.email}. Conclua o PIX no site ou aguarde alguns segundos e tente novamente."
@@ -499,7 +555,11 @@ fun AuthScreen(
         AuthRepository.clearError()
         verifiedPaidEmail = null
         isConfirmingPayment = false
+        isTrialFlow = false
         isSignUp = false
+        if (!lockedTrialEmail.isNullOrBlank() && email.isBlank()) {
+            email = lockedTrialEmail
+        }
         showLoginScreen = true
     }
 
@@ -513,6 +573,7 @@ fun AuthScreen(
             activeCheckoutSessionId = "chk_restored"
         }
         isConfirmingPayment = false
+        isTrialFlow = false
         showLoginScreen = false
         syncPersistedPaymentState(
             paidEmail = preservedEmail,
@@ -521,11 +582,19 @@ fun AuthScreen(
     }
 
     fun submitAuth() {
-        val cleanEmail = email.trim().lowercase()
+        val cleanEmail = (lockedTrialEmail ?: email).trim().lowercase()
         if (cleanEmail.isBlank() || password.length < 6 || isLoading) {
             if (password.length in 1..5) {
                 localError = "Escolha uma senha com pelo menos 6 caracteres para sua conta Host."
             }
+            return
+        }
+        if (isSignUp && isTrialFlow && !cleanEmail.endsWith("@gmail.com")) {
+            localError = "Para ativar o Teste Grátis de 20 dias, informe obrigatoriamente um endereço @gmail.com."
+            return
+        }
+        if (!lockedTrialEmail.isNullOrBlank() && !cleanEmail.equals(lockedTrialEmail, ignoreCase = true)) {
+            localError = "Este dispositivo já está vinculado ao Gmail $lockedTrialEmail. Não é permitido usar outra conta neste aparelho."
             return
         }
         localError = null
@@ -533,7 +602,7 @@ fun AuthScreen(
         isLoading = true
         focusManager.clearFocus(force = true)
         scope.launch {
-            if (isSignUp) AuthRepository.signUpWithEmail(cleanEmail, password)
+            if (isSignUp) AuthRepository.signUpWithEmail(cleanEmail, password, isTrial = isTrialFlow)
             else AuthRepository.signInWithEmail(cleanEmail, password)
             isLoading = false
         }
@@ -615,6 +684,9 @@ fun AuthScreen(
                         showManualEmailFallback = showManualEmailFallback,
                         isConfirmingPayment = isConfirmingPayment,
                         isSignUp = isSignUp,
+                        isTrialSignUp = isTrialFlow,
+                        lockedTrialEmail = lockedTrialEmail,
+                        isTrialExpired = isTrialExpired,
                         email = email,
                         password = password,
                         passwordVisible = passwordVisible,
@@ -626,7 +698,7 @@ fun AuthScreen(
                         formMetrics = formMetrics,
                         scale = largeScale,
                         onEmailChange = {
-                            if (verifiedPaidEmail == null) {
+                            if (verifiedPaidEmail == null && lockedTrialEmail == null) {
                                 email = it
                             }
                             localError = null
@@ -641,8 +713,11 @@ fun AuthScreen(
                         onSubmit = ::submitAuth,
                         onToggleAuthMode = ::toggleAuthMode,
                         onStartCheckout = ::startCheckout,
+                        onStartFreeTrial = ::startFreeTrial,
                         onManualCheckEmailChange = {
-                            manualCheckEmail = it
+                            if (lockedTrialEmail == null) {
+                                manualCheckEmail = it
+                            }
                             localError = null
                             AuthRepository.clearError()
                         },
@@ -665,6 +740,9 @@ fun AuthScreen(
                         showManualEmailFallback = showManualEmailFallback,
                         isConfirmingPayment = isConfirmingPayment,
                         isSignUp = isSignUp,
+                        isTrialSignUp = isTrialFlow,
+                        lockedTrialEmail = lockedTrialEmail,
+                        isTrialExpired = isTrialExpired,
                         email = email,
                         password = password,
                         passwordVisible = passwordVisible,
@@ -674,7 +752,7 @@ fun AuthScreen(
                         deviceLinkEnabled = serverConnectionState.activeServer.capabilities.tvLogin,
                         statusBarTop = statusBarTop,
                         onEmailChange = {
-                            if (verifiedPaidEmail == null) {
+                            if (verifiedPaidEmail == null && lockedTrialEmail == null) {
                                 email = it
                             }
                             localError = null
@@ -689,8 +767,11 @@ fun AuthScreen(
                         onSubmit = ::submitAuth,
                         onToggleAuthMode = ::toggleAuthMode,
                         onStartCheckout = ::startCheckout,
+                        onStartFreeTrial = ::startFreeTrial,
                         onManualCheckEmailChange = {
-                            manualCheckEmail = it
+                            if (lockedTrialEmail == null) {
+                                manualCheckEmail = it
+                            }
                             localError = null
                             AuthRepository.clearError()
                         },
@@ -778,6 +859,9 @@ private fun AuthMobileLayout(
     showManualEmailFallback: Boolean,
     isConfirmingPayment: Boolean,
     isSignUp: Boolean,
+    isTrialSignUp: Boolean = false,
+    lockedTrialEmail: String? = null,
+    isTrialExpired: Boolean = false,
     email: String,
     password: String,
     passwordVisible: Boolean,
@@ -792,6 +876,7 @@ private fun AuthMobileLayout(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onStartCheckout: () -> Unit,
+    onStartFreeTrial: () -> Unit = {},
     onManualCheckEmailChange: (String) -> Unit,
     onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
@@ -836,6 +921,8 @@ private fun AuthMobileLayout(
                         priceLabel = priceLabel,
                         verifiedPaidEmail = verifiedPaidEmail,
                         isSignUp = isSignUp,
+                        isTrialSignUp = isTrialSignUp,
+                        lockedTrialEmail = lockedTrialEmail,
                         email = email,
                         password = password,
                         passwordVisible = passwordVisible,
@@ -967,9 +1054,12 @@ private fun AuthMobileLayout(
                 manualCheckEmail = manualCheckEmail,
                 showManualEmailFallback = showManualEmailFallback,
                 isConfirmingPayment = isConfirmingPayment,
+                lockedTrialEmail = lockedTrialEmail,
+                isTrialExpired = isTrialExpired,
                 authError = authError,
                 metrics = MobileAuthFormMetrics,
                 onStartCheckout = onStartCheckout,
+                onStartFreeTrial = onStartFreeTrial,
                 onManualCheckEmailChange = onManualCheckEmailChange,
                 onProceedPaid = onProceedPaid,
                 onOpenExistingAccountLogin = onOpenExistingAccountLogin,
@@ -990,6 +1080,9 @@ private fun AuthLargeLayout(
     showManualEmailFallback: Boolean,
     isConfirmingPayment: Boolean,
     isSignUp: Boolean,
+    isTrialSignUp: Boolean = false,
+    lockedTrialEmail: String? = null,
+    isTrialExpired: Boolean = false,
     email: String,
     password: String,
     passwordVisible: Boolean,
@@ -1006,6 +1099,7 @@ private fun AuthLargeLayout(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onStartCheckout: () -> Unit,
+    onStartFreeTrial: () -> Unit = {},
     onManualCheckEmailChange: (String) -> Unit,
     onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
@@ -1137,6 +1231,8 @@ private fun AuthLargeLayout(
                             priceLabel = priceLabel,
                             verifiedPaidEmail = verifiedPaidEmail,
                             isSignUp = isSignUp,
+                            isTrialSignUp = isTrialSignUp,
+                            lockedTrialEmail = lockedTrialEmail,
                             email = email,
                             password = password,
                             passwordVisible = passwordVisible,
@@ -1214,10 +1310,13 @@ private fun AuthLargeLayout(
                             manualCheckEmail = manualCheckEmail,
                             showManualEmailFallback = showManualEmailFallback,
                             isConfirmingPayment = isConfirmingPayment,
+                            lockedTrialEmail = lockedTrialEmail,
+                            isTrialExpired = isTrialExpired,
                             authError = authError,
                             metrics = formMetrics,
                             scale = scale,
                             onStartCheckout = onStartCheckout,
+                            onStartFreeTrial = onStartFreeTrial,
                             onManualCheckEmailChange = onManualCheckEmailChange,
                             onProceedPaid = onProceedPaid,
                             onOpenExistingAccountLogin = onOpenExistingAccountLogin,
@@ -1287,7 +1386,10 @@ private fun AuthPaywallContent(
     authError: String?,
     metrics: AuthFormMetrics,
     scale: Float = 1f,
+    lockedTrialEmail: String? = null,
+    isTrialExpired: Boolean = false,
     onStartCheckout: () -> Unit,
+    onStartFreeTrial: () -> Unit = {},
     onManualCheckEmailChange: (String) -> Unit,
     onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
@@ -1305,8 +1407,11 @@ private fun AuthPaywallContent(
             manualCheckEmail = manualCheckEmail,
             showManualEmailFallback = showManualEmailFallback,
             isConfirmingPayment = isConfirmingPayment,
+            lockedTrialEmail = lockedTrialEmail,
+            isTrialExpired = isTrialExpired,
             authError = authError,
             onGoToCheckout = onStartCheckout,
+            onStartFreeTrial = onStartFreeTrial,
             onManualCheckEmailChange = onManualCheckEmailChange,
             onProceedPaid = onProceedPaid,
             onOpenExistingAccountLogin = onOpenExistingAccountLogin,
@@ -1664,6 +1769,9 @@ internal fun AppPaywallPreCheckoutSection(
     onManualCheckEmailChange: (String) -> Unit,
     onProceedPaid: () -> Unit,
     onOpenExistingAccountLogin: () -> Unit,
+    lockedTrialEmail: String? = null,
+    isTrialExpired: Boolean = false,
+    onStartFreeTrial: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -1686,7 +1794,7 @@ internal fun AppPaywallPreCheckoutSection(
                     border = BorderStroke(1.dp, AuthAccentBlueBright.copy(alpha = 0.38f)),
                 ) {
                     Text(
-                        text = "🔒 ACESSO RESTRITO POR ASSINATURA",
+                        text = if (isTrialExpired) "⏳ TESTE GRÁTIS DE 20 DIAS ENCERRADO" else "🔒 ACESSO RESTRITO POR ASSINATURA",
                         style = MaterialTheme.typography.labelSmall.copy(
                             color = AuthAccentBlueSoft,
                             fontWeight = FontWeight.Bold,
@@ -1711,7 +1819,11 @@ internal fun AppPaywallPreCheckoutSection(
                 Spacer(modifier = Modifier.height(5.dp * scale))
 
                 Text(
-                    text = "Para assistir a milhares de filmes, séries, canais ao vivo em 4K e curtir a Sala Cinema 3D, realize o pagamento único de $priceLabel no site oficial.",
+                    text = if (isTrialExpired && !lockedTrialEmail.isNullOrBlank()) {
+                        "Os 20 dias de teste grátis do Gmail $lockedTrialEmail terminaram. O consumo de vídeos e canais está bloqueado até a confirmação do pagamento único de $priceLabel usando este mesmo Gmail."
+                    } else {
+                        "Para assistir a milhares de filmes, séries, canais ao vivo em 4K e curtir a Sala Cinema 3D, realize o pagamento único de $priceLabel no site oficial ou inicie seu teste grátis de 20 dias no app."
+                    },
                     style = MaterialTheme.typography.bodyMedium.copy(
                         color = Color(0xFF93A3BD),
                         fontSize = (12.5f * scale).sp,
@@ -1723,6 +1835,7 @@ internal fun AppPaywallPreCheckoutSection(
 
                 Column(verticalArrangement = Arrangement.spacedBy(7.dp * scale)) {
                     PaywallBenefitItem("✓ Pagamento Único de $priceLabel (Sem mensalidade)", scale)
+                    PaywallBenefitItem("✓ Teste Grátis de 20 dias no App (1 conta por aparelho)", scale)
                     PaywallBenefitItem("✓ Canais Ao Vivo 4K & Full HD", scale)
                     PaywallBenefitItem("✓ Catálogo completo de Filmes e Séries", scale)
                     PaywallBenefitItem("✓ Sala Cinema 3D com som imersivo", scale)
@@ -1738,7 +1851,11 @@ internal fun AppPaywallPreCheckoutSection(
                     border = BorderStroke(1.dp, Color(0xFFF59E0B).copy(alpha = 0.34f)),
                 ) {
                     Text(
-                        text = "⚠️ Importante: Use o mesmo Gmail do pagamento no site para liberar automaticamente sua conta no app.",
+                        text = if (!lockedTrialEmail.isNullOrBlank()) {
+                            "🔒 Importante: Este aparelho está vinculado ao Gmail $lockedTrialEmail. Ao pagar no site, o mesmo Gmail ($lockedTrialEmail) deve ser utilizado obrigatoriamente."
+                        } else {
+                            "⚠️ Importante: Use o mesmo Gmail do pagamento no site (ou do seu Teste Grátis) para liberar automaticamente sua conta no app."
+                        },
                         style = MaterialTheme.typography.bodySmall.copy(
                             color = Color(0xFFFDE68A),
                             fontWeight = FontWeight.SemiBold,
@@ -1812,6 +1929,7 @@ internal fun AppPaywallPreCheckoutSection(
                                 icon = Icons.Rounded.Email,
                                 metrics = metrics,
                                 scale = scale,
+                                readOnly = !lockedTrialEmail.isNullOrBlank(),
                                 keyboardOptions = KeyboardOptions(
                                     keyboardType = KeyboardType.Email,
                                     imeAction = ImeAction.Done,
@@ -1902,6 +2020,22 @@ internal fun AppPaywallPreCheckoutSection(
                                 fontWeight = FontWeight.Bold,
                                 fontSize = (14.5f * scale).sp,
                             ),
+                        )
+                    }
+
+                    if (!isWaitingPayment && !isTrialExpired) {
+                        Spacer(modifier = Modifier.height(9.dp * scale))
+
+                        AuthSecondaryButton(
+                            text = if (!lockedTrialEmail.isNullOrBlank()) {
+                                "🎁 Entrar no Teste Grátis ($lockedTrialEmail)"
+                            } else {
+                                "🎁 Teste Grátis de 20 Dias (Criar Conta)"
+                            },
+                            enabled = true,
+                            height = primaryHeight,
+                            scale = scale,
+                            onClick = onStartFreeTrial,
                         )
                     }
                 }

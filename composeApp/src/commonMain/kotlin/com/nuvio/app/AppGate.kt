@@ -138,6 +138,13 @@ internal fun AppGate(
         DeviceSessionRegistration.registerIfAuthenticated(force = true)
     }
 
+    LaunchedEffect(appVisibility, authState, ownsAppRuntime) {
+        if (!ownsAppRuntime) return@LaunchedEffect
+        if (appVisibility == AppVisibility.Foreground && authState is AuthState.Authenticated) {
+            AuthRepository.revalidateActiveEntitlement()
+        }
+    }
+
     LaunchedEffect(
         profileState.activeProfile?.profileIndex,
         profileState.activeProfile?.name,

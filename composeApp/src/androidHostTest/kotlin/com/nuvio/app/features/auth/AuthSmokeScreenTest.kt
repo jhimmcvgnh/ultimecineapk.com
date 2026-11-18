@@ -55,11 +55,12 @@ class AuthSmokeScreenTest {
     @Test
     fun paywallPreCheckoutSection_preservesPaymentAndProfileLoginActions() {
         var checkoutClicked = false
+        var trialClicked = false
         var loginClicked = false
 
         composeRule.setContent {
             MaterialTheme {
-                Box(modifier = Modifier.size(440.dp, 760.dp)) {
+                Box(modifier = Modifier.size(440.dp, 860.dp)) {
                     AppPaywallPreCheckoutSection(
                         metrics = LargeAuthFormMetrics,
                         scale = 1f,
@@ -72,6 +73,7 @@ class AuthSmokeScreenTest {
                         isConfirmingPayment = false,
                         authError = null,
                         onGoToCheckout = { checkoutClicked = true },
+                        onStartFreeTrial = { trialClicked = true },
                         onManualCheckEmailChange = {},
                         onProceedPaid = {},
                         onOpenExistingAccountLogin = { loginClicked = true },
@@ -85,8 +87,45 @@ class AuthSmokeScreenTest {
         composeRule.onNodeWithText("⚡ Pagar R$ 29,00 no Site e Liberar").assertIsDisplayed().performClick()
         assertTrue(checkoutClicked)
 
+        composeRule.onNodeWithText("🎁 Teste Grátis de 20 Dias (Criar Conta)").assertIsDisplayed().performClick()
+        assertTrue(trialClicked)
+
         composeRule.onNodeWithText("Já possui conta e senha cadastradas? Fazer Login").assertIsDisplayed().performClick()
         assertTrue(loginClicked)
+    }
+
+    @Test
+    fun paywallPreCheckoutSection_locksFreeTrialWhen20DaysExpiredAndRequiresSameGmail() {
+        var checkoutClicked = false
+
+        composeRule.setContent {
+            MaterialTheme {
+                Box(modifier = Modifier.size(440.dp, 860.dp)) {
+                    AppPaywallPreCheckoutSection(
+                        metrics = LargeAuthFormMetrics,
+                        scale = 1f,
+                        primaryHeight = 52.dp,
+                        priceLabel = "R$ 29,00",
+                        isWaitingPayment = false,
+                        confirmedPaidEmail = null,
+                        manualCheckEmail = "teste20dias@gmail.com",
+                        showManualEmailFallback = false,
+                        isConfirmingPayment = false,
+                        lockedTrialEmail = "teste20dias@gmail.com",
+                        isTrialExpired = true,
+                        authError = null,
+                        onGoToCheckout = { checkoutClicked = true },
+                        onManualCheckEmailChange = {},
+                        onProceedPaid = {},
+                        onOpenExistingAccountLogin = {},
+                    )
+                }
+            }
+        }
+
+        composeRule.onNodeWithText("⏳ TESTE GRÁTIS DE 20 DIAS ENCERRADO").assertIsDisplayed()
+        composeRule.onNodeWithText("⚡ Pagar R$ 29,00 no Site e Liberar").assertIsDisplayed().performClick()
+        assertTrue(checkoutClicked)
     }
 
     @Test
@@ -163,5 +202,44 @@ class AuthSmokeScreenTest {
         composeRule.onNodeWithText("← Voltar para a Tela de Pagamento PIX (R$ 29,00)").assertIsDisplayed().performClick()
         assertEquals(1, backCount)
         assertEquals(0, toggleCount)
+    }
+
+    @Test
+    fun animatedSignInCard_renders20DayFreeTrialSignUpMode() {
+        var trialSubmitted = 0
+
+        composeRule.setContent {
+            MaterialTheme {
+                AnimatedLoginAtmosphere(modifier = Modifier.size(440.dp, 880.dp)) {
+                    AnimatedSignInCard(
+                        priceLabel = "R$ 29,00",
+                        verifiedPaidEmail = null,
+                        isSignUp = true,
+                        isTrialSignUp = true,
+                        email = "novo@gmail.com",
+                        password = "secret123",
+                        passwordVisible = false,
+                        isLoading = false,
+                        authError = null,
+                        metrics = LargeAuthFormMetrics,
+                        scale = 1f,
+                        headingStyle = MaterialTheme.typography.headlineSmall,
+                        subtitleStyle = MaterialTheme.typography.bodyMedium,
+                        onEmailChange = {},
+                        onPasswordChange = {},
+                        onPasswordVisibilityToggle = {},
+                        onSubmit = { trialSubmitted++ },
+                        onToggleAuthMode = {},
+                        onReturnToPaywall = {},
+                        onEmailBoundsChange = {},
+                        onPasswordBoundsChange = {},
+                    )
+                }
+            }
+        }
+
+        composeRule.onNodeWithText("Teste Grátis • 20 Dias").assertIsDisplayed()
+        composeRule.onNodeWithText("Ativar Teste Grátis de 20 Dias").assertIsDisplayed().performClick()
+        assertEquals(1, trialSubmitted)
     }
 }

@@ -11,6 +11,9 @@ internal data class SavedHostSession(
     val accessToken: String = "",
     val refreshToken: String = "",
     val paidVerified: Boolean = true,
+    val isTrial: Boolean = false,
+    val trialExpiresAtEpochMs: Long? = null,
+    val trialDaysRemaining: Int = 0,
 )
 
 @Serializable
@@ -23,10 +26,20 @@ internal data class PersistedPaymentState(
     val isSignUpMode: Boolean = true,
 )
 
+@Serializable
+internal data class PersistedDeviceTrialLock(
+    val boundTrialEmail: String,
+    val isTrialExpired: Boolean = false,
+    val trialExpiresAtEpochMs: Long? = null,
+    val trialDaysRemaining: Int = 0,
+    val isPaidUpgraded: Boolean = false,
+)
+
 internal object CineSessionPersistence {
     private const val KEY_HOST_SESSION = "cine_host_session_v1"
     private const val KEY_PAYMENT_STATE = "cine_pending_payment_v1"
     private const val KEY_ACCOUNT_JUST_CREATED = "cine_account_just_created_v1"
+    private const val KEY_DEVICE_TRIAL_LOCK = "cine_device_trial_lock_v1"
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -88,5 +101,32 @@ internal object CineSessionPersistence {
         if (pending.isNullOrBlank() || pending != userId.trim()) return false
         AuthStorage.saveValue(KEY_ACCOUNT_JUST_CREATED, null)
         return true
+    }
+
+    fun loadDeviceTrialLock(): PersistedDeviceTrialLock? {
+        val raw = AuthStorage.loadPaymentValue(KEY_DEVICE_TRIAL_LOCK).orEmpty().trim()
+        if (raw.isEmpty()) return null
+        return runCatching { json.decodeFromString<PersistedDeviceTrialLock>(raw) }
+            .getOrNull()
+            ?.takeIf { it.boundTrialEmail.isNotBlank() }
+    }
+
+    fun saveDeviceTrialLock(lock: PersistedDeviceTrialLock) {
+        val cleanEmail = lock.boundTrialEmail.trim().lowercase()
+        if (cleanEmail.isBlank()) return
+        val normalized = lock.copy(boundTrialEmail = cleanEmail)
+        AuthStorage.savePaymentValue(KEY_DEVICE_TRIAL_LOCK, json.encodeToString(normalized))
+    }
+
+    fun markDeviceTrialPaid(email: String) {
+        val existing = loadDeviceTrialLock() ?: return
+        if (existing.boundTrialEmail.equals(email.trim(), ignoreCase = true)) {
+            saveDeviceTrialLock(
+                existing.copy(
+                    isTrialExpired = false,
+                    isPaidUpgraded = true,
+                ),
+            )
+        }
     }
 }

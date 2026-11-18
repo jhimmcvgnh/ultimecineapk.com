@@ -10,4 +10,6 @@ internal expect object AuthStorage {
 
     fun loadPaymentValue(key: String): String?
     fun savePaymentValue(key: String, value: String?)
+
+    fun loadDeviceFingerprint(): String
 }

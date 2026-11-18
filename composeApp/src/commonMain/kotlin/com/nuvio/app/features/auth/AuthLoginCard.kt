@@ -236,6 +236,8 @@ internal fun AnimatedSignInCard(
     onEmailBoundsChange: (Rect) -> Unit,
     onPasswordBoundsChange: (Rect) -> Unit,
     modifier: Modifier = Modifier,
+    isTrialSignUp: Boolean = false,
+    lockedTrialEmail: String? = null,
 ) {
     val entrance = remember { Animatable(0f) }
     val logoPop = remember { Animatable(0.55f) }
@@ -428,15 +430,15 @@ internal fun AnimatedSignInCard(
 
                 // Centered Heading + Subtitle
                 AnimatedContent(
-                    targetState = Triple(isSignUp, verifiedPaidEmail != null, Unit),
+                    targetState = Triple(isSignUp, verifiedPaidEmail != null, isTrialSignUp),
                     transitionSpec = { fadeIn() togetherWith fadeOut() },
                     label = "cardHeading",
-                ) { (signUp, _, _) ->
+                ) { (signUp, _, trialMode) ->
                     Text(
-                        text = if (signUp) {
-                            stringResource(Res.string.compose_auth_create_account)
-                        } else {
-                            stringResource(Res.string.compose_auth_welcome_back)
+                        text = when {
+                            signUp && trialMode -> "Teste Grátis • 20 Dias"
+                            signUp -> stringResource(Res.string.compose_auth_create_account)
+                            else -> stringResource(Res.string.compose_auth_welcome_back)
                         },
                         style = headingStyle,
                         color = AuthTextPrimary,
@@ -448,14 +450,15 @@ internal fun AnimatedSignInCard(
                 Spacer(modifier = Modifier.height(4.dp * scale))
 
                 AnimatedContent(
-                    targetState = Triple(isSignUp, verifiedPaidEmail != null, Unit),
+                    targetState = Triple(isSignUp, verifiedPaidEmail != null, isTrialSignUp),
                     transitionSpec = { fadeIn() togetherWith fadeOut() },
                     label = "cardSubtitle",
-                ) { (signUp, isVerified, _) ->
+                ) { (signUp, isVerified, trialMode) ->
                     Text(
                         text = when {
                             isVerified && signUp -> "Pagamento aprovado! Agora crie uma senha para o seu Gmail."
                             isVerified -> "Pagamento aprovado! Entre com a senha do seu Gmail."
+                            signUp && trialMode -> "Crie sua conta com seu Gmail para liberar 20 dias grátis neste aparelho."
                             signUp -> "Informe o mesmo Gmail usado no pagamento PIX do site."
                             else -> stringResource(Res.string.compose_auth_sign_in_subtitle)
                         },
@@ -506,6 +509,30 @@ internal fun AnimatedSignInCard(
                         )
                     }
                     Spacer(modifier = Modifier.height(12.dp * scale))
+                } else if (isTrialSignUp || lockedTrialEmail != null) {
+                    Spacer(modifier = Modifier.height(6.dp * scale))
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = AuthAccentBlue.copy(alpha = 0.16f),
+                        border = BorderStroke(1.dp, AuthAccentBlueBright.copy(alpha = 0.45f)),
+                    ) {
+                        Text(
+                            text = if (lockedTrialEmail != null) {
+                                "🔒 Aparelho vinculado ao Gmail $lockedTrialEmail. Limite de 1 conta de teste grátis por dispositivo — após os 20 dias, o pagamento de $priceLabel deverá ser feito com este mesmo Gmail."
+                            } else {
+                                "🎁 Teste Grátis de 20 Dias (1 conta por aparelho): Cadastre seu Gmail verdadeiro. Após os 20 dias, para continuar assistindo será obrigatório pagar $priceLabel usando este mesmo Gmail."
+                            },
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFF93C5FD),
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = (12f * scale).sp,
+                                lineHeight = (17f * scale).sp,
+                            ),
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(12.dp * scale))
                 } else {
                     Spacer(modifier = Modifier.height(8.dp * scale))
                 }
@@ -514,11 +541,15 @@ internal fun AnimatedSignInCard(
                 AnimatedAuthTextField(
                     value = email,
                     onValueChange = onEmailChange,
-                    placeholder = if (isSignUp) "Gmail usado na compra PIX" else stringResource(Res.string.compose_auth_email),
+                    placeholder = when {
+                        isSignUp && isTrialSignUp -> "Seu Gmail (@gmail.com) para o Teste Grátis"
+                        isSignUp -> "Gmail usado na compra PIX"
+                        else -> stringResource(Res.string.compose_auth_email)
+                    },
                     icon = Icons.Rounded.Email,
                     metrics = metrics,
                     scale = scale,
-                    readOnly = false,
+                    readOnly = lockedTrialEmail != null || verifiedPaidEmail != null,
                     modifier = Modifier.onGloballyPositioned { coordinates ->
                         onEmailBoundsChange(coordinates.boundsInRoot())
                     },
@@ -572,6 +603,7 @@ internal fun AnimatedSignInCard(
                 // Cobalt-blue animated shimmer primary CTA button
                 AnimatedShimmerBlueButton(
                     text = when {
+                        isSignUp && isTrialSignUp -> "Ativar Teste Grátis de 20 Dias"
                         isSignUp && verifiedPaidEmail != null -> "Criar Conta Principal (Host)"
                         isSignUp -> stringResource(Res.string.compose_auth_create_account)
                         else -> stringResource(Res.string.compose_auth_sign_in)
